@@ -1,0 +1,54 @@
+{
+  "name": "vscode-debugger-mcp",
+  "displayName": "VSCode Debugger MCP",
+  "description": "将当前活动的 VSCode 调试器暴露为本地 MCP Server，供 AI 编程助手进行 attach/断点/单步/变量查看等辅助调试",
+  "version": "1.0.0",
+  "publisher": "vscode-debugger-mcp",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Debuggers", "Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "vscodeDebuggerMcp.showStatus",
+        "title": "VSCode Debugger MCP: 显示状态"
+      },
+      {
+        "command": "vscodeDebuggerMcp.restart",
+        "title": "VSCode Debugger MCP: 重启 MCP 服务"
+      }
+    ],
+    "configuration": {
+      "title": "VSCode Debugger MCP",
+      "properties": {
+        "vscodeDebuggerMcp.port": {
+          "type": "number",
+          "default": 37643,
+          "minimum": 1024,
+          "maximum": 65535,
+          "description": "MCP 服务监听端口"
+        },
+        "vscodeDebuggerMcp.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "扩展激活时自动启动 MCP 服务"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}
