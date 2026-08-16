@@ -17,7 +17,7 @@ export async function activate(context: vscode.ExtensionContext) {
     // 状态栏
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 0);
     statusBarItem.command = 'vscodeDebuggerMcp.showStatus';
-    statusBarItem.text = '$(debug) MCP: Off';
+    statusBarItem.text = '$(debug) VSCodeDebugMCP: Off';
     statusBarItem.tooltip = 'VSCode Debugger MCP';
     statusBarItem.show();
     context.subscriptions.push(statusBarItem);
@@ -25,7 +25,9 @@ export async function activate(context: vscode.ExtensionContext) {
     // 命令
     context.subscriptions.push(
         vscode.commands.registerCommand('vscodeDebuggerMcp.showStatus', showStatus),
-        vscode.commands.registerCommand('vscodeDebuggerMcp.restart', restartServer)
+        vscode.commands.registerCommand('vscodeDebuggerMcp.restart', restartServer),
+        vscode.commands.registerCommand('vscodeDebuggerMcp.start', startServer),
+        vscode.commands.registerCommand('vscodeDebuggerMcp.stop', stopServer)
     );
 
     // 配置变更监听
@@ -98,21 +100,89 @@ function updateStatusBar(): void {
     const session = vscode.debug.activeDebugSession;
 
     if (!running) {
-        statusBarItem.text = '$(debug) MCP: Off';
+        statusBarItem.text = '$(debug) VSCodeDebugMCP: Off';
         statusBarItem.tooltip = 'VSCode Debugger MCP (stopped)';
     } else if (session) {
         const icon = status === 'paused' ? '$(debug-pause)' : '$(debug-start)';
-        statusBarItem.text = `${icon} MCP:${mcpServer.port} ${status}`;
+        statusBarItem.text = `${icon} VSCodeDebugMCP:${mcpServer.port} ${status}`;
         statusBarItem.tooltip = `VSCode Debugger MCP\nPort: ${mcpServer.port}\nSession: ${session.name}\nState: ${status}`;
     } else {
-        statusBarItem.text = `$(debug) MCP:${mcpServer.port}`;
+        statusBarItem.text = `$(debug) VSCodeDebugMCP:${mcpServer.port}`;
         statusBarItem.tooltip = `VSCode Debugger MCP\nPort: ${mcpServer.port}\nNo active debug session`;
     }
 }
 
 async function showStatus(): Promise<void> {
     if (!mcpServer || !debuggerService) return;
-    const info = await debuggerService.getInstanceInfo();
+
+    const running = mcpServer.isRunning;
+    const port = mcpServer.port;
+
+    const items: Array<vscode.QuickPickItem & { action?: string }> = [
+        { label: running ? '$(debug-start) 重启 MCP 服务' : '$(debug-start) 开始 MCP 服务', action: running ? 'restart' : 'start' },
+        { label: '$(debug-stop) 停止 MCP 服务', action: 'stop', description: running ? undefined : '(未运行)' },
+        { label: `$(gear) 修改端口 (当前: ${port})`, action: 'changePort' },
+        { label: '$(terminal) 查看详细状态', action: 'details' },
+    ];
+
+    const picked = await vscode.window.showQuickPick(items, {
+        placeHolder: `VSCodeDebugMCP — ${running ? `运行中 :${port}` : '已停止'}`,
+    });
+
+    if (!picked || !picked.action) return;
+
+    switch (picked.action) {
+        case 'start':
+            await startServer();
+            break;
+        case 'restart':
+            await restartServer();
+            break;
+        case 'stop':
+            await stopServer();
+            break;
+        case 'changePort':
+            await changePort();
+            break;
+        case 'details':
+            await showDetails();
+            break;
+    }
+}
+
+async function stopServer(): Promise<void> {
+    if (!mcpServer) return;
+    await mcpServer.stop();
+    vscode.window.showInformationMessage(`VSCode Debugger MCP stopped`);
+    updateStatusBar();
+}
+
+async function changePort(): Promise<void> {
+    if (!mcpServer) return;
+    const input = await vscode.window.showInputBox({
+        prompt: '输入新的端口号 (1024–65535)',
+        value: String(mcpServer.port),
+        validateInput: (v) => {
+            const n = parseInt(v, 10);
+            if (isNaN(n) || n < 1024 || n > 65535) return '请输入 1024–65535 之间的数字';
+            return undefined;
+        },
+    });
+    if (!input) return;
+    const newPort = parseInt(input, 10);
+    if (newPort === mcpServer.port) return;
+    await vscode.workspace.getConfiguration('vscodeDebuggerMcp').update('port', newPort, vscode.ConfigurationTarget.Global);
+    const ok = await mcpServer.restart(newPort);
+    if (ok) {
+        vscode.window.showInformationMessage(`VSCode Debugger MCP restarted on port ${newPort}`);
+    } else {
+        vscode.window.showErrorMessage(`VSCode Debugger MCP failed to restart on port ${newPort}`);
+    }
+    updateStatusBar();
+}
+
+async function showDetails(): Promise<void> {
+    if (!mcpServer || !debuggerService) return;
     const status = debuggerService.getDebugStatus();
     const log = mcpServer.getLog().slice(-10).join('\n');
 
@@ -124,11 +194,11 @@ async function showStatus(): Promise<void> {
     panel.appendLine('');
     panel.appendLine(`Server:        ${mcpServer.isRunning ? 'Running' : 'Stopped'}`);
     panel.appendLine(`Endpoint:      ${mcpServer.endpoint}`);
-    panel.appendLine(`Instance ID:   ${info.instanceId}`);
-    panel.appendLine(`IDE:           ${info.ide} ${info.version}`);
-    panel.appendLine(`Workspace:     ${info.workspace || '(none)'}`);
-    panel.appendLine(`Debug Session: ${info.debugSessionName ?? '(none)'}`);
-    panel.appendLine(`Session Type:  ${info.debugSessionType ?? '(none)'}`);
+    panel.appendLine(`Instance ID:   ${status.instanceId}`);
+    panel.appendLine(`IDE:           ${status.ide} ${status.version}`);
+    panel.appendLine(`Workspace:     ${status.workspace || '(none)'}`);
+    panel.appendLine(`Debug Session: ${status.sessionName ?? '(none)'}`);
+    panel.appendLine(`Session Type:  ${status.sessionType ?? '(none)'}`);
     panel.appendLine(`State:         ${status.state}`);
     panel.appendLine(`Thread ID:     ${status.threadId ?? '(none)'}`);
     panel.appendLine(`Frame ID:      ${status.frameId ?? '(none)'}`);

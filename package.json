@@ -15,11 +15,19 @@
     "commands": [
       {
         "command": "vscodeDebuggerMcp.showStatus",
-        "title": "VSCode Debugger MCP: 显示状态"
+        "title": "VSCode Debugger MCP: 操作菜单"
       },
       {
         "command": "vscodeDebuggerMcp.restart",
         "title": "VSCode Debugger MCP: 重启 MCP 服务"
+      },
+      {
+        "command": "vscodeDebuggerMcp.start",
+        "title": "VSCode Debugger MCP: 开始 MCP 服务"
+      },
+      {
+        "command": "vscodeDebuggerMcp.stop",
+        "title": "VSCode Debugger MCP: 停止 MCP 服务"
       }
     ],
     "configuration": {

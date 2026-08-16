@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { DebuggerService } from './debuggerService';
 import { StackFrame, Variable, Thread, PauseContext } from './types';
+import { redactVariables, redactExpressionResult, REDACTION_NOTICE } from './secretRedaction';
 
 /**
  * 栈帧/线程/变量/源码/捕获操作（工具 23-32）。
@@ -40,29 +41,51 @@ export class FrameOps {
         return { selected: true, message: `Frame ${frameIndex} (${frame.name}) selected` };
     }
 
-    // ═══ 26. debug_get_frame_locals ═══
-    async getFrameLocals(frameIndex: number, maxDepth = 1, maxItems = 100, expectedPauseId?: string): Promise<{ arguments: Variable[]; locals: Variable[]; stale?: boolean }> {
+    // ═══ 26+31. debug_get_frame_locals（合并了原 debug_get_locals，frameIndex 可选，省略时用当前帧） ═══
+    async getFrameLocals(frameIndex?: number, maxDepth = 1, maxItems = 100, expectedPauseId?: string, names?: string[]): Promise<{ arguments: Variable[]; locals: Variable[]; stale?: boolean; redacted?: boolean; redactionNotice?: string | null }> {
         const v = this.svc.validatePauseIdOptional(expectedPauseId);
         if (!v.valid) return { arguments: [], locals: [], stale: true };
         const s = this.session; if (!s) return { arguments: [], locals: [] };
-        const frame = await this.getFrameByIndex(frameIndex);
-        if (!frame) return { arguments: [], locals: [] };
-        return this.getScopesAndVariables(s, frame.id, maxDepth, maxItems);
+        let frameId: number | null = null;
+        if (frameIndex !== undefined) {
+            const frame = await this.getFrameByIndex(frameIndex);
+            if (!frame) return { arguments: [], locals: [] };
+            frameId = frame.id;
+        } else {
+            if (this.svc._currentFrameId === null) {
+                const frame = await this.getFrameByIndex(this.svc._currentFrameIndex);
+                if (frame) this.svc._currentFrameId = frame.id;
+            }
+            frameId = this.svc._currentFrameId;
+        }
+        if (frameId === null) return { arguments: [], locals: [] };
+        const r = await this.getScopesAndVariables(s, frameId, maxDepth, maxItems);
+        let args = r.arguments, locals = r.locals;
+        let anyRed = false;
+        if (names && names.length > 0) {
+            const nameSet = new Set(names);
+            args = args.filter(vr => nameSet.has(vr.name) || (vr.evaluateName && nameSet.has(vr.evaluateName)));
+            locals = locals.filter(vr => nameSet.has(vr.name) || (vr.evaluateName && nameSet.has(vr.evaluateName)));
+        }
+        const ar = redactVariables(args); const lr = redactVariables(locals);
+        anyRed = ar.redacted || lr.redacted;
+        return { arguments: ar.variables, locals: lr.variables, redacted: anyRed, redactionNotice: anyRed ? REDACTION_NOTICE : null };
     }
 
-    // ═══ 27. debug_get_current_frame ═══
-    async getCurrentFrame(expectedPauseId?: string): Promise<{ frame: StackFrame | null; stale?: boolean }> {
+    // ═══ 27+28. debug_get_call_stack（合并了原 debug_get_current_frame，返回 frames + currentFrame） ═══
+    async getCallStack(limit = 50, expectedPauseId?: string): Promise<{ frames: StackFrame[]; currentFrame: StackFrame | null; currentFrameIndex: number | null; stale?: boolean }> {
         const v = this.svc.validatePauseIdOptional(expectedPauseId);
-        if (!v.valid) return { frame: null, stale: true };
-        const stack = await this.getCallStackInternal(this.svc._currentFrameIndex, 1);
-        return { frame: stack.length > 0 ? stack[0] : null };
-    }
-
-    // ═══ 28. debug_get_call_stack ═══
-    async getCallStack(limit = 50, expectedPauseId?: string): Promise<StackFrame[]> {
-        const v = this.svc.validatePauseIdOptional(expectedPauseId);
-        if (!v.valid) return [];
-        return this.getCallStackInternal(0, limit);
+        if (!v.valid) return { frames: [], currentFrame: null, currentFrameIndex: this.svc._currentFrameIndex, stale: true };
+        const frames = await this.getCallStackInternal(0, limit);
+        const idx = this.svc._currentFrameIndex;
+        let currentFrame: StackFrame | null = null;
+        if (idx >= 0 && idx < frames.length) {
+            currentFrame = frames[idx];
+        } else if (idx >= 0) {
+            const single = await this.getCallStackInternal(idx, 1);
+            currentFrame = single.length > 0 ? single[0] : null;
+        }
+        return { frames, currentFrame, currentFrameIndex: idx };
     }
 
     // ═══ 29. debug_get_source_context ═══
@@ -76,7 +99,7 @@ export class FrameOps {
     }
 
     // ═══ 30. debug_capture_pause_context ═══
-    async capturePauseContext(opts: { stackLimit?: number; linesBefore?: number; linesAfter?: number; maxDepth?: number; maxItems?: number; preferEditorBuffer?: boolean; expectedPauseId?: string }): Promise<PauseContext> {
+    async capturePauseContext(opts: { stackLimit?: number; linesBefore?: number; linesAfter?: number; maxDepth?: number; maxItems?: number; preferEditorBuffer?: boolean; expectedPauseId?: string }): Promise<PauseContext & { stale?: boolean; redacted?: boolean; redactionNotice?: string | null }> {
         const v = this.svc.validatePauseIdOptional(opts.expectedPauseId);
         const stale = !v.valid;
         const s = this.session;
@@ -89,33 +112,45 @@ export class FrameOps {
         }
         let locals: Variable[] = [];
         let args: Variable[] = [];
+        let anyRed = false;
         if (s && frame && !stale) {
             const r = await this.getScopesAndVariables(s, frame.id, opts.maxDepth ?? 1, opts.maxItems ?? 100);
-            locals = r.locals; args = r.arguments;
+            const ar = redactVariables(r.arguments); const lr = redactVariables(r.locals);
+            args = ar.variables; locals = lr.variables;
+            anyRed = ar.redacted || lr.redacted;
         }
         const bps = this.svc.listBreakpoints().filter(bp => bp.verified && bp.enabled);
         return {
             pauseId: this.svc._pauseId ?? '', reason: this.svc._stopReason ?? 'unknown',
             threadId: this.svc._currentThreadId ?? 0, frame, callStack, sourceContext,
-            locals, arguments: args, threads, matchingBreakpoints: bps
+            locals, arguments: args, threads, matchingBreakpoints: bps,
+            redacted: anyRed, redactionNotice: anyRed ? REDACTION_NOTICE : null,
+            stale: stale || undefined
         };
     }
 
-    // ═══ 31. debug_get_locals ═══
-    async getLocals(maxDepth = 1, maxItems = 100, expectedPauseId?: string): Promise<{ arguments: Variable[]; locals: Variable[]; stale?: boolean }> {
+    // ═══ 31. debug_get_locals → 已合并到 debug_get_frame_locals ═══
+
+    // ═══ 31a. debug_list_variable_names ═══
+    async listVariableNames(frameIndex: number, expectedPauseId?: string): Promise<{ variables: { name: string; type: string | null; evaluateName: string | null }[]; stale?: boolean }> {
         const v = this.svc.validatePauseIdOptional(expectedPauseId);
-        if (!v.valid) return { arguments: [], locals: [], stale: true };
-        const s = this.session; if (!s) return { arguments: [], locals: [] };
-        if (this.svc._currentFrameId === null) {
-            const frame = await this.getFrameByIndex(this.svc._currentFrameIndex);
-            if (frame) this.svc._currentFrameId = frame.id;
-        }
-        if (this.svc._currentFrameId === null) return { arguments: [], locals: [] };
-        return this.getScopesAndVariables(s, this.svc._currentFrameId, maxDepth, maxItems);
+        if (!v.valid) return { variables: [], stale: true };
+        const s = this.session; if (!s) return { variables: [] };
+        const frame = await this.getFrameByIndex(frameIndex);
+        if (!frame) return { variables: [] };
+        const r = await this.getScopesAndVariables(s, frame.id, 0, 500);
+        const all = [...r.arguments, ...r.locals];
+        return {
+            variables: all.map(v => ({
+                name: v.name,
+                type: v.type ?? null,
+                evaluateName: v.evaluateName ?? null
+            }))
+        };
     }
 
     // ═══ 32. debug_evaluate ═══
-    async evaluate(opts: { expression: string; timeoutMs?: number; maxDepth?: number; maxItems?: number; expectedPauseId?: string }): Promise<{ result: string; type: string | null; children: Variable[]; stale?: boolean }> {
+    async evaluate(opts: { expression: string; timeoutMs?: number; maxDepth?: number; maxItems?: number; expectedPauseId?: string }): Promise<{ result: string; type: string | null; children: Variable[]; stale?: boolean; redacted?: boolean; redactionNotice?: string | null }> {
         const v = this.svc.validatePauseIdOptional(opts.expectedPauseId);
         if (!v.valid) return { result: '', type: null, children: [], stale: true };
         const s = this.session; if (!s) return { result: '', type: null, children: [] };
@@ -124,13 +159,16 @@ export class FrameOps {
             if (frame) this.svc._currentFrameId = frame.id;
         }
         try {
-            const r = await this.withTimeout(Promise.resolve(s.customRequest('evaluate', { expression: opts.expression, frameId: this.svc._currentFrameId, context: 'watch' })), opts.timeoutMs ?? 3000);
+            const r = await this.withTimeout(Promise.resolve(s.customRequest('evaluate', { expression: opts.expression, frameId: this.svc._currentFrameId, context: 'repl' })), opts.timeoutMs ?? 3000);
             const body = r as any;
             const children: Variable[] = [];
             if (body.variablesReference > 0 && (opts.maxDepth ?? 0) > 0) {
                 await this.collectVariables(s, body.variablesReference, children, opts.maxDepth ?? 0, 0, opts.maxItems ?? 50, new Set());
             }
-            return { result: body.result ?? '', type: body.type ?? null, children };
+            const red = redactExpressionResult(opts.expression, body.result ?? '');
+            const childRed = redactVariables(children);
+            const notice = (red.redacted || childRed.redacted) ? REDACTION_NOTICE : null;
+            return { result: red.value, type: body.type ?? null, children: childRed.variables, redacted: red.redacted || childRed.redacted, redactionNotice: notice };
         } catch (e: any) {
             return { result: `Error: ${e.message}`, type: null, children: [] };
         }

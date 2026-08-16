@@ -131,7 +131,7 @@ export class AdvancedDebugOps {
             const raw = Buffer.from(base64Data, 'base64');
             const hex: string[] = []; const ascii: string[] = [];
             for (let i = 0; i < raw.length; i += bytesPerRow) {
-                const slice = raw.slice(i, i + bytesPerRow);
+                const slice = raw.subarray(i, i + bytesPerRow);
                 hex.push(Array.from(slice).map(b => b.toString(16).padStart(2, '0')).join(' '));
                 ascii.push(Array.from(slice).map(b => b >= 32 && b < 127 ? String.fromCharCode(b) : '.').join(''));
             }

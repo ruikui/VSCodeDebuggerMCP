@@ -1,5 +1,4 @@
 import * as http from 'http';
-import * as vscode from 'vscode';
 import { DebuggerService } from './debuggerService';
 import { ToolDefinitions, ToolMap } from './toolDefinitions';
 import { JsonRpcRequest, JsonRpcResponse } from './types';
@@ -13,9 +12,9 @@ export class McpServer {
     private readonly _debugger: DebuggerService;
     private _port: number;
     private _running = false;
-    private _initialized = false;
     private _log: string[] = [];
     private readonly _maxLogEntries = 200;
+    private _toolChain: Promise<unknown> = Promise.resolve();
 
     constructor(debuggerService: DebuggerService, port: number) {
         this._debugger = debuggerService;
@@ -177,7 +176,6 @@ export class McpServer {
     }
 
     private handleInitialize(id: string | number | null, params?: any): JsonRpcResponse {
-        this._initialized = true;
         const protocolVersion = params?.protocolVersion ?? '2024-11-05';
         return this.makeResult(id, {
             protocolVersion,
@@ -211,8 +209,16 @@ export class McpServer {
             return this.makeError(id, -32602, `Unknown tool: ${toolName}`);
         }
 
+        // 串行化工具调用：避免并发修改共享调试状态产生竞态。
+        // debug_wait_for_pause 是长轮询且不修改共享状态，直接并发执行，避免阻塞后续调用（如 pause/stop 无法打断等待）。
+        const serialized = toolName !== 'debug_wait_for_pause';
+        const task = serialized
+            ? this._toolChain.then(() => this.dispatchToolCall(toolName, args))
+            : this.dispatchToolCall(toolName, args);
+        if (serialized) this._toolChain = task.then(() => undefined, () => undefined);
+
         try {
-            const result = await this.dispatchToolCall(toolName, args);
+            const result = await task;
             return this.makeResult(id, {
                 content: [{
                     type: 'text',
@@ -230,7 +236,7 @@ export class McpServer {
         }
     }
 
-    // ── 工具分发（49 个工具）──
+    // ── 工具分发（44 个工具，合并精简后）──
 
     private async dispatchToolCall(name: string, args: any): Promise<any> {
         const dbg = this._debugger;
@@ -241,13 +247,10 @@ export class McpServer {
         switch (name) {
             // ═══ 实例与状态 ═══
             case 'debug_get_status':
-                return dbg.getDebugStatus();
-            case 'debug_get_instance_info':
-                return dbg.getInstanceInfo();
+                return dbg.getDebugStatus(args.expectedPauseId);
             case 'debug_list_processes':
                 return dbg.listProcesses(args.nameFilter, args.limit);
-            case 'debug_verify_target':
-                return dbg.verifyTarget(args.processId, args.expectedExecutable, args.expectedSolution);
+            // ═══ 3. debug_verify_target → 已移除 ═══
             case 'debug_attach_process':
                 return dbg.attachProcess(args);
             case 'debug_launch_and_attach':
@@ -260,12 +263,16 @@ export class McpServer {
             // ═══ 断点 ═══
             case 'debug_add_breakpoint':
                 return dbg.addBreakpoint(args);
+            case 'debug_add_logpoint':
+                return dbg.addLogpoint(args);
             case 'debug_list_breakpoints':
                 return dbg.listBreakpoints();
             case 'debug_set_breakpoint_enabled':
                 return dbg.setBreakpointEnabled(args);
             case 'debug_remove_breakpoint':
                 return dbg.removeBreakpoint(args);
+            case 'debug_clear_all_breakpoints':
+                return dbg.clearAllBreakpoints();
 
             // ═══ 执行控制 ═══
             case 'debug_start':
@@ -276,18 +283,12 @@ export class McpServer {
                 return dbg.continueExecution(args.expectedPauseId);
             case 'debug_pause':
                 return dbg.pauseExecution(args.processId);
-            case 'debug_step_over':
-                return dbg.stepOver(args.expectedPauseId);
-            case 'debug_step_into':
-                return dbg.stepInto(args.expectedPauseId);
-            case 'debug_step_out':
-                return dbg.stepOut(args.expectedPauseId);
+            case 'debug_step':
+                return dbg.step(args.stepAction, args.expectedPauseId);
             case 'debug_stop':
                 return dbg.stopDebugging(args.processId);
             case 'debug_wait_for_pause':
-                return dbg.waitForPause(args.timeoutMs, args.pollIntervalMs);
-            case 'debug_get_stop_reason':
-                return dbg.getStopReason(args.expectedPauseId);
+                return dbg.waitForPause(args.timeoutMs);
 
             // ═══ 线程与栈帧 ═══
             case 'debug_list_threads':
@@ -297,17 +298,17 @@ export class McpServer {
             case 'debug_select_frame':
                 return fo.selectFrame(args.frameIndex, args.expectedPauseId);
             case 'debug_get_frame_locals':
-                return fo.getFrameLocals(args.frameIndex, args.maxDepth, args.maxItems, args.expectedPauseId);
-            case 'debug_get_current_frame':
-                return fo.getCurrentFrame(args.expectedPauseId);
+                return fo.getFrameLocals(args.frameIndex, args.maxDepth, args.maxItems, args.expectedPauseId, args.names);
+            case 'debug_list_variable_names':
+                return fo.listVariableNames(args.frameIndex, args.expectedPauseId);
+            // ═══ 27. debug_get_current_frame → 已合并到 debug_get_call_stack ═══
             case 'debug_get_call_stack':
                 return fo.getCallStack(args.limit, args.expectedPauseId);
             case 'debug_get_source_context':
                 return fo.getSourceContext(args);
             case 'debug_capture_pause_context':
                 return fo.capturePauseContext(args);
-            case 'debug_get_locals':
-                return fo.getLocals(args.maxDepth, args.maxItems, args.expectedPauseId);
+            // ═══ 31. debug_get_locals → 已合并到 debug_get_frame_locals ═══
             case 'debug_evaluate':
                 return fo.evaluate(args);
 
@@ -322,8 +323,7 @@ export class McpServer {
                 return pc.listWatches();
             case 'debug_remove_capture_watch':
                 return pc.removeWatch(args.watchId);
-            case 'debug_get_latest_pause_capture':
-                return pc.getLatest();
+            // ═══ 38. debug_get_latest_pause_capture → 已合并到 debug_get_pause_capture ═══
             case 'debug_list_pause_captures':
                 return pc.listCaptures(args.limit);
             case 'debug_get_pause_capture':

@@ -4,9 +4,9 @@ import * as fs from 'fs';
 import * as os from 'os';
 import { exec, spawn } from 'child_process';
 import {
-    InstanceInfo, DebugStatus, DebuggerState,
-    StackFrame, Variable, Thread, BreakpointInfo,
-    DapStopEvent, ProcessInfo, VerifyTargetResult,
+    DebugStatus, DebuggerState,
+    BreakpointInfo,
+    DapStopEvent, ProcessInfo,
     SourceMapEntry
 } from './types';
 import { PauseCaptureManager } from './pauseCaptureManager';
@@ -86,7 +86,7 @@ export class DebuggerService {
             const doc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === uri.fsPath);
             if (doc) return doc.getText();
         }
-        try { return fs.readFileSync(mapped, 'utf-8'); } catch { return null; }
+        try { return await fs.promises.readFile(mapped, 'utf-8'); } catch { return null; }
     }
 
     // ── DAP 事件追踪 ──
@@ -117,41 +117,36 @@ export class DebuggerService {
         this._currentFrameId = null; this._currentFrameIndex = 0; this._pauseId = null;
     }
 
-    // ═══ 1. debug_get_instance_info ═══
-    async getInstanceInfo(): Promise<InstanceInfo> {
+    // ═══ 1+2. debug_get_status（合并了原 instance_info 和 stop_reason） ═══
+    getDebugStatus(expectedPauseId?: string): DebugStatus {
         const s = this.getActiveSession();
+        const v = this.validatePauseIdOptional(expectedPauseId);
+        const stale = !v.valid;
         return {
             instanceId: this._instanceId, ide: 'Visual Studio Code', version: vscode.version,
-            workspace: this.getWorkspacePath(), solution: this.getWorkspacePath(),
-            state: this.getCurrentState(), hasActiveSession: !!s,
-            debugSessionName: s?.name ?? null, debugSessionType: s?.type ?? null,
-            processId: (s?.configuration as any)?.processId ?? null
-        };
-    }
-
-    // ═══ 2. debug_get_status ═══
-    getDebugStatus(): DebugStatus {
-        const s = this.getActiveSession();
-        return {
+            workspace: this.getWorkspacePath(),
             state: this.getCurrentState(), hasActiveSession: !!s,
             sessionName: s?.name ?? null, sessionType: s?.type ?? null,
             processId: (s?.configuration as any)?.processId ?? null,
             threadId: this._currentThreadId, frameId: this._currentFrameId,
-            frameIndex: this._currentFrameIndex, pauseId: this._pauseId, stopReason: this._stopReason
+            frameIndex: this._currentFrameIndex, pauseId: this._pauseId, stopReason: this._stopReason,
+            stale: stale || undefined
         };
     }
 
     // ═══ 3. debug_list_processes ═══
     async listProcesses(nameFilter?: string, limit = 100): Promise<ProcessInfo[]> {
         const plat = os.platform();
-        const cmd = plat === 'win32' ? 'wmic process get ProcessId,Name,ExecutablePath,CommandLine /format:csv' : 'ps -eo pid,comm,args';
+        const cmd = plat === 'win32'
+            ? 'powershell -NoProfile -Command "Get-CimInstance Win32_Process | Select-Object ProcessId,Name,ExecutablePath,CommandLine | ConvertTo-Csv -NoTypeInformation"'
+            : 'ps -eo pid,comm,args';
         return new Promise((resolve) => {
             exec(cmd, { maxBuffer: 20 * 1024 * 1024 }, (err, stdout) => {
                 if (err) { resolve([]); return; }
                 const lines = stdout.split('\n').map(l => l.trim()).filter(l => l);
                 const results: ProcessInfo[] = [];
                 if (plat === 'win32') {
-                    const cols = lines[0].toLowerCase().split(',');
+                    const cols = lines[0].replace(/"/g, '').toLowerCase().split(',');
                     const pi = cols.indexOf('processid'), ni = cols.indexOf('name'), ci = cols.indexOf('commandline'), ei = cols.indexOf('executablepath');
                     for (let i = 1; i < lines.length && results.length < limit; i++) {
                         const p = this.parseCsv(lines[i]);
@@ -166,7 +161,9 @@ export class DebuggerService {
                         const pid = parseInt(p[0] || '0', 10); if (!pid) continue;
                         const name = p[1] || '', cl = p.slice(2).join(' ');
                         if (nameFilter) { const f = nameFilter.toLowerCase(); if (!name.toLowerCase().includes(f) && !cl.toLowerCase().includes(f)) continue; }
-                        results.push({ pid, name, commandLine: cl, executablePath: name || null });
+                        let exe: string | null = name || null;
+                        if (plat !== 'darwin') { try { const r = fs.readlinkSync(`/proc/${pid}/exe`); if (r) exe = r; } catch {} }
+                        results.push({ pid, name, commandLine: cl, executablePath: exe });
                     }
                 }
                 resolve(results);
@@ -178,17 +175,31 @@ export class DebuggerService {
         for (const c of line) { if (c === '"') q = !q; else if (c === ',' && !q) { r.push(cur); cur = ''; } else cur += c; }
         r.push(cur); return r;
     }
-
-    // ═══ 4. debug_verify_target ═══
-    async verifyTarget(processId: number, expectedExecutable: string, expectedSolution: string): Promise<VerifyTargetResult> {
-        const procs = await this.listProcesses(undefined, 500);
-        const proc = procs.find(p => p.pid === processId);
-        const exe = proc?.executablePath ?? proc?.name ?? '';
-        const exeMatch = exe.toLowerCase() === expectedExecutable.toLowerCase();
-        const ws = this.getWorkspacePath();
-        const wsMatch = !ws || ws === expectedSolution;
-        return { processId, processName: proc?.name ?? '(not found)', executablePath: exe, expectedExecutable, executableMatch: exeMatch, workspace: ws, expectedWorkspace: expectedSolution, workspaceMatch: wsMatch, verified: exeMatch && wsMatch && !!proc };
+    private async waitForProcess(pid: number, timeoutMs: number): Promise<boolean> {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+            const procs = await this.listProcesses(undefined, 500);
+            if (procs.some(p => p.pid === pid)) return true;
+            await new Promise(r => setTimeout(r, 200));
+        }
+        return false;
     }
+    private async waitForSessionEnd(session: vscode.DebugSession, timeoutMs: number): Promise<void> {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+            if (vscode.debug.activeDebugSession !== session) return;
+            await new Promise(r => setTimeout(r, 100));
+        }
+    }
+    private parseArgs(str: string): string[] {
+        const args: string[] = [];
+        const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(str)) !== null) args.push(m[1] ?? m[2] ?? m[3]);
+        return args;
+    }
+
+    // ═══ 4. debug_verify_target → 已移除（attach_process 已包含验证逻辑） ═══
 
     // ═══ 5. debug_attach_process ═══
     async attachProcess(opts: { processId?: number; processName?: string; expectedExecutable: string; expectedSolution: string; engine?: string }): Promise<{ attached: boolean; message: string }> {
@@ -212,17 +223,19 @@ export class DebuggerService {
     }
 
     // ═══ 6. debug_launch_and_attach ═══
-    async launchAndAttach(opts: { executable: string; arguments?: string; workingDirectory?: string; expectedSolution: string; engine?: string }): Promise<{ launched: boolean; attached: boolean; processId: number | null; message: string }> {
+    async launchAndAttach(opts: { executable: string; arguments?: string; workingDirectory?: string; expectedSolution: string; engine?: string; timeoutMs?: number }): Promise<{ launched: boolean; attached: boolean; processId: number | null; message: string }> {
         const wsCheck = this.validateWorkspace(opts.expectedSolution);
         if (!wsCheck.valid) return { launched: false, attached: false, processId: null, message: wsCheck.error! };
         if (!fs.existsSync(opts.executable)) return { launched: false, attached: false, processId: null, message: `Executable not found: ${opts.executable}` };
         const workDir = opts.workingDirectory || path.dirname(opts.executable);
-        const args = opts.arguments ? opts.arguments.split(' ') : [];
+        const args = opts.arguments ? this.parseArgs(opts.arguments) : [];
         const child = spawn(opts.executable, args, { cwd: workDir, detached: true, stdio: 'ignore' });
         child.unref();
         const pid = child.pid ?? null;
         if (!pid) return { launched: false, attached: false, processId: null, message: 'Failed to launch' };
-        await new Promise(r => setTimeout(r, 1000));
+        const timeoutMs = opts.timeoutMs ?? 30000;
+        const ready = await this.waitForProcess(pid, timeoutMs);
+        if (!ready) return { launched: true, attached: false, processId: pid, message: `Launched PID ${pid} but it did not appear within ${timeoutMs}ms` };
         const config: vscode.DebugConfiguration = { type: opts.engine ?? 'cppdbg', name: `Attach to ${path.basename(opts.executable)}`, request: 'attach', processId: pid } as any;
         const folder = vscode.workspace.workspaceFolders?.[0];
         const ok = await vscode.debug.startDebugging(folder, config);
@@ -248,9 +261,10 @@ export class DebuggerService {
 
     // ═══ 9. debug_add_breakpoint ═══
     async addBreakpoint(opts: { file: string; line: number; condition?: string }): Promise<{ id: string; verified: boolean; message: string }> {
+        if (!opts.file || typeof opts.line !== 'number' || opts.line < 1) return { id: '', verified: false, message: 'file and a line >= 1 are required' };
         const loc = new vscode.Location(vscode.Uri.file(opts.file), new vscode.Range(opts.line - 1, 0, opts.line - 1, 0));
         const bp = new vscode.SourceBreakpoint(loc, true, opts.condition);
-        await vscode.debug.addBreakpoints([bp]);
+        vscode.debug.addBreakpoints([bp]);
         const id = `bp-${++this._breakpointCounter}`;
         this._breakpointIdMap.set(id, bp);
         return { id, verified: true, message: '' };
@@ -264,7 +278,8 @@ export class DebuggerService {
             for (const [k, v] of this._breakpointIdMap) { if (v === bp) { id = k; break; } }
             if (!id) { id = `bp-${++this._breakpointCounter}`; this._breakpointIdMap.set(id, bp); }
             if (bp instanceof vscode.SourceBreakpoint) {
-                results.push({ id, type: 'source', enabled: bp.enabled, file: bp.location.uri.fsPath, line: bp.location.range.start.line + 1, column: bp.location.range.start.character + 1, condition: bp.condition ?? null, hitCondition: bp.hitCondition ?? null, logMessage: null, verified: true, message: null, tag: null });
+                const logMessage = (bp as any).logMessage ?? null;
+                results.push({ id, type: logMessage ? 'log' : 'source', enabled: bp.enabled, file: bp.location.uri.fsPath, line: bp.location.range.start.line + 1, column: bp.location.range.start.character + 1, condition: bp.condition ?? null, hitCondition: bp.hitCondition ?? null, logMessage, verified: true, message: null, tag: null });
             } else if (bp instanceof vscode.FunctionBreakpoint) {
                 results.push({ id, type: 'function', enabled: bp.enabled, file: null, line: null, column: null, condition: bp.condition ?? null, hitCondition: bp.hitCondition ?? null, logMessage: null, verified: true, message: null, tag: null });
             }
@@ -282,8 +297,12 @@ export class DebuggerService {
             return true;
         });
         if (!target) return { updated: false, message: `Breakpoint at ${opts.file}:${opts.line} not found` };
-        await vscode.debug.removeBreakpoints([target]);
-        if (opts.enabled) { const nb = this.recreateBp(target, true); if (nb) await vscode.debug.addBreakpoints([nb]); }
+        vscode.debug.removeBreakpoints([target]);
+        const nb = this.recreateBp(target, opts.enabled);
+        if (nb) {
+            vscode.debug.addBreakpoints([nb]);
+            for (const [k, v] of this._breakpointIdMap) { if (v === target) { this._breakpointIdMap.set(k, nb); break; } }
+        }
         return { updated: true, message: `Breakpoint at ${opts.file}:${opts.line} ${opts.enabled ? 'enabled' : 'disabled'}` };
     }
 
@@ -297,14 +316,35 @@ export class DebuggerService {
             return true;
         });
         if (!target) return { removed: false, message: `Breakpoint at ${opts.file}:${opts.line} not found` };
-        await vscode.debug.removeBreakpoints([target]);
+        vscode.debug.removeBreakpoints([target]);
         for (const [k, v] of this._breakpointIdMap) { if (v === target) { this._breakpointIdMap.delete(k); break; } }
         return { removed: true, message: `Breakpoint at ${opts.file}:${opts.line} removed` };
     }
     private recreateBp(bp: vscode.Breakpoint, enabled: boolean): vscode.Breakpoint | null {
-        if (bp instanceof vscode.SourceBreakpoint) return new vscode.SourceBreakpoint(bp.location, enabled, bp.condition, bp.hitCondition);
+        if (bp instanceof vscode.SourceBreakpoint) return new vscode.SourceBreakpoint(bp.location, enabled, bp.condition, bp.hitCondition, (bp as any).logMessage);
         if (bp instanceof vscode.FunctionBreakpoint) return new vscode.FunctionBreakpoint((bp as any).functionName, enabled, bp.condition, bp.hitCondition);
         return null;
+    }
+
+    // ═══ 12a. debug_add_logpoint ═══
+    async addLogpoint(opts: { file: string; line: number; logMessage: string }): Promise<{ id: string; verified: boolean; message: string }> {
+        if (!opts.file || typeof opts.line !== 'number' || opts.line < 1) return { id: '', verified: false, message: 'file and a line >= 1 are required' };
+        if (!opts.logMessage) return { id: '', verified: false, message: 'logMessage is required' };
+        const loc = new vscode.Location(vscode.Uri.file(opts.file), new vscode.Range(opts.line - 1, 0, opts.line - 1, 0));
+        const bp = new vscode.SourceBreakpoint(loc, true, undefined, undefined, opts.logMessage);
+        vscode.debug.addBreakpoints([bp]);
+        const id = `bp-${++this._breakpointCounter}`;
+        this._breakpointIdMap.set(id, bp);
+        return { id, verified: true, message: '' };
+    }
+
+    // ═══ 12b. debug_clear_all_breakpoints ═══
+    async clearAllBreakpoints(): Promise<{ removed: number; message: string }> {
+        const all = vscode.debug.breakpoints.slice();
+        if (all.length === 0) return { removed: 0, message: 'No breakpoints to clear' };
+        vscode.debug.removeBreakpoints(all);
+        this._breakpointIdMap.clear();
+        return { removed: all.length, message: `Cleared ${all.length} breakpoint(s)` };
     }
 
     // ═══ 13. debug_start ═══
@@ -326,9 +366,8 @@ export class DebuggerService {
         const wsCheck = this.validateWorkspace(opts.expectedSolution);
         if (!wsCheck.valid) return { restarted: false, message: wsCheck.error! };
         const s = this.getActiveSession();
-        if (s) await vscode.debug.stopDebugging(s);
+        if (s) { await vscode.debug.stopDebugging(s); await this.waitForSessionEnd(s, 5000); }
         this.handleTerminateEvent();
-        await new Promise(r => setTimeout(r, 500));
         if (this._lastLaunchConfig && this._lastLaunchFolder) {
             const ok = await vscode.debug.startDebugging(this._lastLaunchFolder, this._lastLaunchConfig);
             return { restarted: ok, message: ok ? 'Restarted' : 'Failed to restart' };
@@ -354,25 +393,14 @@ export class DebuggerService {
         try { await s.customRequest('pause', { threadId: this._currentThreadId ?? 1 }); return { paused: true, message: 'Pause requested' }; }
         catch (e: any) { return { paused: false, message: `Failed: ${e.message}` }; }
     }
-    async stepOver(expectedPauseId: string): Promise<{ stepped: boolean; message: string; stale?: boolean }> {
+    // ═══ 17. debug_step（合并了原 step_into/step_over/step_out） ═══
+    async step(stepAction: 'into' | 'over' | 'out', expectedPauseId: string): Promise<{ stepped: boolean; message: string; stale?: boolean }> {
         const v = this.validatePauseIdRequired(expectedPauseId);
         if (!v.valid) return { stepped: false, message: v.error!, stale: v.error === 'stalePauseContext' };
         const s = this.getActiveSession(); if (!s) return { stepped: false, message: 'No active session' };
-        try { await s.customRequest('next', { threadId: this._currentThreadId ?? 1 }); this._lastStopEvent = null; this._pauseId = null; this._stopReason = null; return { stepped: true, message: 'Step over' }; }
-        catch (e: any) { return { stepped: false, message: `Failed: ${e.message}` }; }
-    }
-    async stepInto(expectedPauseId: string): Promise<{ stepped: boolean; message: string; stale?: boolean }> {
-        const v = this.validatePauseIdRequired(expectedPauseId);
-        if (!v.valid) return { stepped: false, message: v.error!, stale: v.error === 'stalePauseContext' };
-        const s = this.getActiveSession(); if (!s) return { stepped: false, message: 'No active session' };
-        try { await s.customRequest('stepIn', { threadId: this._currentThreadId ?? 1 }); this._lastStopEvent = null; this._pauseId = null; this._stopReason = null; return { stepped: true, message: 'Step into' }; }
-        catch (e: any) { return { stepped: false, message: `Failed: ${e.message}` }; }
-    }
-    async stepOut(expectedPauseId: string): Promise<{ stepped: boolean; message: string; stale?: boolean }> {
-        const v = this.validatePauseIdRequired(expectedPauseId);
-        if (!v.valid) return { stepped: false, message: v.error!, stale: v.error === 'stalePauseContext' };
-        const s = this.getActiveSession(); if (!s) return { stepped: false, message: 'No active session' };
-        try { await s.customRequest('stepOut', { threadId: this._currentThreadId ?? 1 }); this._lastStopEvent = null; this._pauseId = null; this._stopReason = null; return { stepped: true, message: 'Step out' }; }
+        const dapReq = stepAction === 'into' ? 'stepIn' : stepAction === 'out' ? 'stepOut' : 'next';
+        const label = stepAction === 'into' ? 'Step into' : stepAction === 'out' ? 'Step out' : 'Step over';
+        try { await s.customRequest(dapReq, { threadId: this._currentThreadId ?? 1 }); this._lastStopEvent = null; this._pauseId = null; this._stopReason = null; return { stepped: true, message: label }; }
         catch (e: any) { return { stepped: false, message: `Failed: ${e.message}` }; }
     }
     async stopDebugging(_processId?: number): Promise<{ stopped: boolean; message: string }> {
@@ -382,7 +410,7 @@ export class DebuggerService {
     }
 
     // ═══ 21. debug_wait_for_pause ═══
-    async waitForPause(timeoutMs = 30000, _pollIntervalMs = 200): Promise<DebugStatus> {
+    async waitForPause(timeoutMs = 30000): Promise<DebugStatus> {
         if (this._lastStopEvent) return this.getDebugStatus();
         if (!this.getActiveSession()) return this.getDebugStatus();
         return new Promise<DebugStatus>((resolve) => {
@@ -392,12 +420,7 @@ export class DebuggerService {
         });
     }
 
-    // ═══ 22. debug_get_stop_reason ═══
-    getStopReason(expectedPauseId?: string): { pauseId: string | null; reason: string | null; threadId: number | null; stale?: boolean } {
-        const v = this.validatePauseIdOptional(expectedPauseId);
-        if (!v.valid) return { pauseId: this._pauseId, reason: this._stopReason, threadId: this._currentThreadId, stale: true };
-        return { pauseId: this._pauseId, reason: this._stopReason, threadId: this._currentThreadId };
-    }
+    // ═══ 22. debug_get_stop_reason → 已合并到 debug_get_status ═══
 
     dispose() {
         for (const d of this._trackerDisposables) { try { d.dispose(); } catch {} }

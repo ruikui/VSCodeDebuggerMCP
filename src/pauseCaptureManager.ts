@@ -4,6 +4,7 @@ import {
     PauseCapture, CaptureWatch, CaptureWatchResult,
     PauseCaptureStatus, PauseCaptureMetadata, Variable
 } from './types';
+import { redactVariables, redactExpressionResult, REDACTION_NOTICE } from './secretRedaction';
 
 /**
  * 暂停捕获系统（工具 33-41）：在每次调试器停止时自动捕获快照，
@@ -59,8 +60,11 @@ export class PauseCaptureManager {
         return { removed: true, message: `Watch ${watchId} removed` };
     }
 
-    // ═══ 38. debug_get_latest_pause_capture ═══
-    getLatest(): PauseCapture | null {
+    // ═══ 38+40. debug_get_pause_capture（合并了原 debug_get_latest_pause_capture，captureId 可选，省略时返回最新） ═══
+    getCapture(captureId?: string): PauseCapture | null {
+        if (captureId !== undefined) {
+            return this._captures.get(captureId) ?? null;
+        }
         if (this._order.length === 0) return null;
         return this._captures.get(this._order[this._order.length - 1]) ?? null;
     }
@@ -83,9 +87,6 @@ export class PauseCaptureManager {
         return result;
     }
 
-    // ═══ 40. debug_get_pause_capture ═══
-    getCapture(captureId: string): PauseCapture | null { return this._captures.get(captureId) ?? null; }
-
     // ═══ 41. debug_clear_pause_captures ═══
     clear(): { cleared: number; message: string } {
         const count = this._captures.size;
@@ -101,19 +102,29 @@ export class PauseCaptureManager {
     private async createCapture(): Promise<PauseCapture | null> {
         const fo: FrameOps = this.svc.frames;
         const captureId = `capture-${++this._counter}-${Date.now().toString(36)}`;
-        const callStack = await fo.getCallStack(50);
-        const frame = callStack.length > 0 ? callStack[0] : null;
+        const stackResult = await fo.getCallStack(50);
+        const callStack = stackResult.frames;
+        const frame = stackResult.currentFrame ?? (callStack.length > 0 ? callStack[0] : null);
         let sourceContext: PauseCapture['sourceContext'] = null;
         if (frame?.source?.path) {
             sourceContext = await fo.getSourceContext({ frameIndex: 0, linesBefore: 30, linesAfter: 30, preferEditorBuffer: true });
         }
         let locals: Variable[] = []; let args: Variable[] = [];
-        if (frame) { const r = await fo.getFrameLocals(0, this._defaultMaxDepth, this._defaultMaxItems); locals = r.locals; args = r.arguments; }
+        let anyRed = false;
+        if (frame) {
+            const r = await fo.getFrameLocals(0, this._defaultMaxDepth, this._defaultMaxItems);
+            const ar = redactVariables(r.arguments); const lr = redactVariables(r.locals);
+            args = ar.variables; locals = lr.variables;
+            anyRed = ar.redacted || lr.redacted;
+        }
         const watchResults: CaptureWatchResult[] = [];
         for (const w of this._watches.values()) {
             try {
                 const er = await fo.evaluate({ expression: w.expression, maxDepth: w.maxDepth, maxItems: w.maxItems });
-                watchResults.push({ watchId: w.watchId, expression: w.expression, value: er.result, type: er.type, error: null, children: er.children });
+                const red = redactExpressionResult(w.expression, er.result);
+                const childRed = redactVariables(er.children);
+                if (red.redacted || childRed.redacted) anyRed = true;
+                watchResults.push({ watchId: w.watchId, expression: w.expression, value: red.value, type: er.type, error: null, children: childRed.variables });
             } catch (e: any) {
                 watchResults.push({ watchId: w.watchId, expression: w.expression, value: '', type: null, error: e.message, children: [] });
             }
@@ -121,7 +132,8 @@ export class PauseCaptureManager {
         return {
             captureId, pauseId: this.svc._pauseId ?? '', timestamp: new Date().toISOString(),
             reason: this.svc._stopReason ?? 'unknown', threadId: this.svc._currentThreadId ?? 0,
-            frame, callStack, sourceContext, locals, arguments: args, watches: watchResults
+            frame, callStack, sourceContext, locals, arguments: args, watches: watchResults,
+            redacted: anyRed, redactionNotice: anyRed ? REDACTION_NOTICE : null
         };
     }
 

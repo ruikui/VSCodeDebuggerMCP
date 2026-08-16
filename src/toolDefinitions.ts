@@ -1,20 +1,21 @@
 import { McpTool } from './types';
 
 /**
- * MCP 工具定义表：完整对齐 VisualStudioDebugger 参考项目的 49 个工具。
+ * MCP 工具定义表：完整对齐 VisualStudioDebugger 参考项目的 44 个工具（合并精简后）。
  * 参数名与 schema 与参考项目保持一致，描述适配 VSCode 语境。
  */
 export const ToolDefinitions: McpTool[] = [
     // ═══ 实例与状态 ═══
     {
         name: 'debug_get_status',
-        description: '获取当前 VSCode 实例、调试器模式、进程、线程和停止原因。',
-        inputSchema: { type: 'object', properties: {}, additionalProperties: false }
-    },
-    {
-        name: 'debug_get_instance_info',
-        description: '标识此 MCP 端点背后的 VSCode 进程和打开的工作区。在进程控制操作前调用此工具。',
-        inputSchema: { type: 'object', properties: {}, additionalProperties: false }
+        description: '获取当前 VSCode 实例信息（instanceId/ide/version/workspace）、调试器模式、进程、线程、停止原因。可选传 expectedPauseId 检测陈旧暂停上下文（合并了原 debug_get_instance_info 和 debug_get_stop_reason）。',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                expectedPauseId: { type: 'string', description: '可选。传入已知 pauseId，若与当前不匹配则返回 stale: true。' }
+            },
+            additionalProperties: false
+        }
     },
     {
         name: 'debug_list_processes',
@@ -28,20 +29,7 @@ export const ToolDefinitions: McpTool[] = [
             additionalProperties: false
         }
     },
-    {
-        name: 'debug_verify_target',
-        description: '验证 PID 解析到预期可执行文件，且此端点服务于预期工作区，然后再 attach。',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                processId: { type: 'integer', minimum: 1 },
-                expectedExecutable: { type: 'string', description: '必需的绝对可执行文件路径' },
-                expectedSolution: { type: 'string', description: '必需的绝对工作区文件夹路径' }
-            },
-            required: ['processId', 'expectedExecutable', 'expectedSolution'],
-            additionalProperties: false
-        }
-    },
+    // ═══ 3. debug_verify_target → 已移除（attach_process 已包含验证逻辑） ═══
     {
         name: 'debug_attach_process',
         description: '在验证可执行文件路径和工作区路径后，将 VSCode attach 到一个进程。',
@@ -110,7 +98,21 @@ export const ToolDefinitions: McpTool[] = [
                 line: { type: 'integer', minimum: 1 },
                 condition: { type: 'string' }
             },
-            required: ['file'],
+            required: ['file', 'line'],
+            additionalProperties: false
+        }
+    },
+    {
+        name: 'debug_add_logpoint',
+        description: '在绝对文件路径和 1-based 行号处添加日志断点（logpoint），命中时输出 logMessage 到调试控制台而不中断。logMessage 可用 {expression} 插值。',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                file: { type: 'string', description: '必需的绝对源文件路径' },
+                line: { type: 'integer', minimum: 1 },
+                logMessage: { type: 'string', description: '必需。输出到调试控制台的文本，可用 {expr} 插值变量。' }
+            },
+            required: ['file', 'line', 'logMessage'],
             additionalProperties: false
         }
     },
@@ -148,11 +150,16 @@ export const ToolDefinitions: McpTool[] = [
             additionalProperties: false
         }
     },
+    {
+        name: 'debug_clear_all_breakpoints',
+        description: '清除所有断点（含源码断点、日志断点、函数断点、数据断点）。',
+        inputSchema: { type: 'object', properties: {}, additionalProperties: false }
+    },
 
     // ═══ 执行控制 ═══
     {
         name: 'debug_start',
-        description: '开始调试工作区的配置启动目标。需要设计模式和预期工作区路径。',
+        description: '开始调试工作区的配置启动目标。需要预期工作区路径。',
         inputSchema: {
             type: 'object',
             properties: {
@@ -190,58 +197,35 @@ export const ToolDefinitions: McpTool[] = [
     },
     {
         name: 'debug_pause',
-        description: '中断运行中的被调试程序。需要当前调试 PID。',
+        description: '中断运行中的被调试程序。',
         inputSchema: {
             type: 'object',
             properties: {
-                processId: { type: 'integer', minimum: 1 }
+                processId: { type: 'integer', minimum: 1, description: '可选。保留用于兼容性，实际中断的是当前活跃调试会话。' }
             },
             additionalProperties: false
         }
     },
     {
-        name: 'debug_step_over',
-        description: '步过当前语句。需要当前 pauseId。',
+        name: 'debug_step',
+        description: '执行单步调试：into（步进）、over（步过）、out（步出）。需要当前 pauseId。（合并了原 step_into/step_over/step_out）',
         inputSchema: {
             type: 'object',
             properties: {
+                stepAction: { type: 'string', enum: ['into', 'over', 'out'], description: '步进类型：into=步进，over=步过，out=步出' },
                 expectedPauseId: { type: 'string' }
             },
-            required: ['expectedPauseId'],
-            additionalProperties: false
-        }
-    },
-    {
-        name: 'debug_step_into',
-        description: '步进当前语句。需要当前 pauseId。',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                expectedPauseId: { type: 'string' }
-            },
-            required: ['expectedPauseId'],
-            additionalProperties: false
-        }
-    },
-    {
-        name: 'debug_step_out',
-        description: '步出当前函数。需要当前 pauseId。',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                expectedPauseId: { type: 'string' }
-            },
-            required: ['expectedPauseId'],
+            required: ['stepAction', 'expectedPauseId'],
             additionalProperties: false
         }
     },
     {
         name: 'debug_stop',
-        description: '终止活动调试会话。需要当前调试 PID。',
+        description: '终止活动调试会话。',
         inputSchema: {
             type: 'object',
             properties: {
-                processId: { type: 'integer', minimum: 1 }
+                processId: { type: 'integer', minimum: 1, description: '可选。保留用于兼容性，实际终止的是当前活跃调试会话。' }
             },
             additionalProperties: false
         }
@@ -252,19 +236,7 @@ export const ToolDefinitions: McpTool[] = [
         inputSchema: {
             type: 'object',
             properties: {
-                timeoutMs: { type: 'integer', minimum: 100, maximum: 120000, default: 30000 },
-                pollIntervalMs: { type: 'integer', minimum: 50, maximum: 2000, default: 200 }
-            },
-            additionalProperties: false
-        }
-    },
-    {
-        name: 'debug_get_stop_reason',
-        description: '将当前暂停分类为断点、异常、单步完成或手动暂停。',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                expectedPauseId: { type: 'string' }
+                timeoutMs: { type: 'integer', minimum: 100, maximum: 120000, default: 30000 }
             },
             additionalProperties: false
         }
@@ -285,7 +257,7 @@ export const ToolDefinitions: McpTool[] = [
     },
     {
         name: 'debug_select_thread',
-        description: '在 VSCode 中切换当前线程。需要当前 pauseId。',
+        description: '切换此 MCP 端点的当前线程。需要当前 pauseId。注意：VSCode 未公开程序化切换 UI 线程焦点的 API，此操作仅更新内部状态，不改变 VSCode 界面的线程选择。',
         inputSchema: {
             type: 'object',
             properties: {
@@ -298,7 +270,7 @@ export const ToolDefinitions: McpTool[] = [
     },
     {
         name: 'debug_select_frame',
-        description: '在 VSCode 中切换当前栈帧。需要当前 pauseId。',
+        description: '切换此 MCP 端点的当前栈帧。需要当前 pauseId。注意：VSCode 未公开程序化切换 UI 栈帧焦点的 API，此操作仅更新内部状态，不改变 VSCode 界面的栈帧选择。',
         inputSchema: {
             type: 'object',
             properties: {
@@ -311,33 +283,36 @@ export const ToolDefinitions: McpTool[] = [
     },
     {
         name: 'debug_get_frame_locals',
-        description: '读取特定栈帧的参数和局部变量，不改变 VSCode 选择。',
+        description: '读取指定栈帧（或省略 frameIndex 时读取当前帧）的参数和局部变量，不改变 VSCode 选择。可按名过滤以实现最小权限读取。凭据值会被自动脱敏。（合并了原 debug_get_locals）',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                frameIndex: { type: 'integer', minimum: 0, description: '可选。省略时使用当前帧。' },
+                maxDepth: { type: 'integer', minimum: 0, maximum: 4, default: 1 },
+                maxItems: { type: 'integer', minimum: 1, maximum: 500, default: 100, description: '整个返回树共享的总节点预算' },
+                names: { type: 'array', items: { type: 'string' }, description: '可选变量名白名单，仅返回这些变量。先用 debug_list_variable_names 枚举。' },
+                expectedPauseId: { type: 'string' }
+            },
+            additionalProperties: false
+        }
+    },
+    {
+        name: 'debug_list_variable_names',
+        description: '仅枚举指定栈帧的变量名和类型，不读取值。用于最小权限模型：先枚举名称，再用 debug_get_frame_locals 的 names 过滤按需取值。凭据值不会在此泄漏。',
         inputSchema: {
             type: 'object',
             properties: {
                 frameIndex: { type: 'integer', minimum: 0 },
-                maxDepth: { type: 'integer', minimum: 0, maximum: 4, default: 1 },
-                maxItems: { type: 'integer', minimum: 1, maximum: 500, default: 100, description: '整个返回树共享的总节点预算' },
                 expectedPauseId: { type: 'string' }
             },
             required: ['frameIndex'],
             additionalProperties: false
         }
     },
-    {
-        name: 'debug_get_current_frame',
-        description: '读取当前栈帧，包括源位置和符号状态。',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                expectedPauseId: { type: 'string' }
-            },
-            additionalProperties: false
-        }
-    },
+    // ═══ 27. debug_get_current_frame → 已合并到 debug_get_call_stack ═══
     {
         name: 'debug_get_call_stack',
-        description: '暂停时读取当前线程的调用栈。',
+        description: '暂停时读取当前线程的调用栈，同时返回 currentFrame 和 currentFrameIndex。（合并了原 debug_get_current_frame）',
         inputSchema: {
             type: 'object',
             properties: {
@@ -379,19 +354,7 @@ export const ToolDefinitions: McpTool[] = [
             additionalProperties: false
         }
     },
-    {
-        name: 'debug_get_locals',
-        description: '读取当前栈帧的参数和局部变量。',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                maxDepth: { type: 'integer', minimum: 0, maximum: 4, default: 1 },
-                maxItems: { type: 'integer', minimum: 1, maximum: 500, default: 100, description: '整个返回树共享的总节点预算' },
-                expectedPauseId: { type: 'string' }
-            },
-            additionalProperties: false
-        }
-    },
+    // ═══ 31. debug_get_locals → 已合并到 debug_get_frame_locals ═══
     {
         name: 'debug_evaluate',
         description: '在当前帧中求值调试器表达式。除非增加 maxDepth，否则仅返回根值。',
@@ -460,11 +423,7 @@ export const ToolDefinitions: McpTool[] = [
             additionalProperties: false
         }
     },
-    {
-        name: 'debug_get_latest_pause_capture',
-        description: '实验性。读取最新存储的暂停捕获，包括其有界快照负载。',
-        inputSchema: { type: 'object', properties: {}, additionalProperties: false }
-    },
+    // ═══ 38. debug_get_latest_pause_capture → 已合并到 debug_get_pause_capture ═══
     {
         name: 'debug_list_pause_captures',
         description: '实验性。列出已存储的暂停捕获元数据（不含负载体）。',
@@ -478,13 +437,12 @@ export const ToolDefinitions: McpTool[] = [
     },
     {
         name: 'debug_get_pause_capture',
-        description: '实验性。通过 captureId 读取一个已存储的暂停捕获。',
+        description: '实验性。通过 captureId 读取一个已存储的暂停捕获。省略 captureId 时返回最新捕获（合并了原 debug_get_latest_pause_capture）。',
         inputSchema: {
             type: 'object',
             properties: {
-                captureId: { type: 'string' }
+                captureId: { type: 'string', description: '可选。省略时返回最新捕获。' }
             },
-            required: ['captureId'],
             additionalProperties: false
         }
     },
@@ -497,7 +455,7 @@ export const ToolDefinitions: McpTool[] = [
     // ═══ 数据断点 ═══
     {
         name: 'debug_add_data_breakpoint',
-        description: '添加数据断点，在内存地址被写入时触发。需要当前 pauseId。',
+        description: '添加数据断点，在内存地址被写入时触发。需要当前 pauseId。注意：VSCode DAP 协议不支持字节级监视宽度，dataCount 参数仅作记录，实际监视粒度由调试适配器决定。',
         inputSchema: {
             type: 'object',
             properties: {
@@ -526,7 +484,7 @@ export const ToolDefinitions: McpTool[] = [
     // ═══ 模块 ═══
     {
         name: 'debug_list_modules',
-        description: '列出已加载的模块及其符号状态和优化状态。',
+        description: '列出调试会话已加载的源文件（近似模块列表）。注意：VSCode DAP 无标准 modules 请求，此工具返回的是 loadedSources 源文件列表而非带基址的原生模块，符号状态与优化状态信息可能缺失。',
         inputSchema: {
             type: 'object',
             properties: {
@@ -556,7 +514,7 @@ export const ToolDefinitions: McpTool[] = [
     // ═══ 寄存器 ═══
     {
         name: 'debug_get_registers',
-        description: '从当前或选定栈帧读取 CPU 寄存器。',
+        description: '从当前或选定栈帧读取 CPU 寄存器。注意：依赖非标准 DAP registers 请求，多数调试适配器不支持，可能返回空组。',
         inputSchema: {
             type: 'object',
             properties: {

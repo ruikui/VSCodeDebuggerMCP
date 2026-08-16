@@ -1,5 +1,3 @@
-import * as vscode from 'vscode';
-
 /** MCP 工具定义 */
 export interface McpTool {
     name: string;
@@ -10,22 +8,14 @@ export interface McpTool {
 /** 调试器状态 */
 export type DebuggerState = 'running' | 'paused' | 'stopped' | 'starting';
 
-/** 实例信息 */
-export interface InstanceInfo {
+/** 调试状态（合并了原 instance_info 和 stop_reason 的字段） */
+export interface DebugStatus {
+    // 实例信息（原 InstanceInfo）
     instanceId: string;
     ide: string;
     version: string;
     workspace: string;
-    solution: string;
-    state: DebuggerState;
-    hasActiveSession: boolean;
-    debugSessionName: string | null;
-    debugSessionType: string | null;
-    processId: number | null;
-}
-
-/** 调试状态 */
-export interface DebugStatus {
+    // 调试状态
     state: DebuggerState;
     hasActiveSession: boolean;
     sessionName: string | null;
@@ -36,6 +26,7 @@ export interface DebugStatus {
     frameIndex: number | null;
     pauseId: string | null;
     stopReason: string | null;
+    stale?: boolean;
 }
 
 /** 栈帧 */
@@ -132,6 +123,8 @@ export interface PauseCapture {
     locals: Variable[];
     arguments: Variable[];
     watches: CaptureWatchResult[];
+    redacted?: boolean;
+    redactionNotice?: string | null;
 }
 
 export interface PauseCaptureStatus {
@@ -225,20 +218,6 @@ export interface ProcessInfo {
     name: string;
     commandLine: string;
     executablePath: string | null;
-}
-
-/** ── 验证目标 ── */
-
-export interface VerifyTargetResult {
-    processId: number;
-    processName: string;
-    executablePath: string;
-    expectedExecutable: string;
-    executableMatch: boolean;
-    workspace: string;
-    expectedWorkspace: string;
-    workspaceMatch: boolean;
-    verified: boolean;
 }
 
 /** ── MCP JSON-RPC ── */
