@@ -18,16 +18,20 @@
         "title": "VSCode Debugger MCP: 操作菜单"
       },
       {
-        "command": "vscodeDebuggerMcp.restart",
-        "title": "VSCode Debugger MCP: 重启 MCP 服务"
-      },
-      {
-        "command": "vscodeDebuggerMcp.start",
+        "command": "vscodeDebuggerMcp.startServer",
         "title": "VSCode Debugger MCP: 开始 MCP 服务"
       },
       {
-        "command": "vscodeDebuggerMcp.stop",
+        "command": "vscodeDebuggerMcp.stopServer",
         "title": "VSCode Debugger MCP: 停止 MCP 服务"
+      },
+      {
+        "command": "vscodeDebuggerMcp.restartServer",
+        "title": "VSCode Debugger MCP: 重启 MCP 服务"
+      },
+      {
+        "command": "vscodeDebuggerMcp.changePort",
+        "title": "VSCode Debugger MCP: 修改端口"
       }
     ],
     "configuration": {
@@ -44,6 +48,11 @@
           "type": "boolean",
           "default": true,
           "description": "扩展激活时自动启动 MCP 服务"
+        },
+        "vscodeDebuggerMcp.useBroker": {
+          "type": "boolean",
+          "default": true,
+          "description": "使用 Broker 多窗口架构（首窗口 fork 独立进程绑定公共端口，各窗口后端随机端口注册，按 instanceId 路由）"
         }
       }
     }
@@ -52,11 +61,17 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "lint": "eslint src --ext ts"
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTests.js",
+    "package": "vsce package --no-git-tag-version"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
-    "typescript": "^5.3.0"
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.57.0",
+    "typescript": "^5.3.0",
+    "vsce": "^2.24.0"
   }
 }

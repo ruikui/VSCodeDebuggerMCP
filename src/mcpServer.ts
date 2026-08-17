@@ -6,7 +6,14 @@ import { JsonRpcRequest, JsonRpcResponse } from './types';
 /**
  * MCP HTTP 服务器：手写 HTTP + JSON-RPC 2.0，实现 MCP 协议核心方法。
  * 仅监听 127.0.0.1，不接受外部连接。
+ *
+ * 多窗口架构：后端监听随机端口，向 Broker 注册，Broker 按 instanceId 路由。
+ * Host/Origin 头校验防 DNS-rebinding。
  */
+
+/** 允许的 Host 头值（防 DNS-rebinding）。仅允许本地回环地址。 */
+const ALLOWED_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
+
 export class McpServer {
     private readonly _server: http.Server;
     private readonly _debugger: DebuggerService;
@@ -15,22 +22,86 @@ export class McpServer {
     private _log: string[] = [];
     private readonly _maxLogEntries = 200;
     private _toolChain: Promise<unknown> = Promise.resolve();
+    private readonly _instanceId: string;
+    private readonly _brokerPort?: number;
+    private _heartbeatTimer: NodeJS.Timeout | null = null;
+    private _registered = false;
 
-    constructor(debuggerService: DebuggerService, port: number) {
+    constructor(debuggerService: DebuggerService, port: number, instanceId?: string, brokerPort?: number) {
         this._debugger = debuggerService;
         this._port = port;
+        this._instanceId = instanceId ?? debuggerService.getDebugStatus().instanceId;
+        this._brokerPort = brokerPort;
         this._server = http.createServer((req, res) => this.handleRequest(req, res));
     }
 
     get port(): number { return this._port; }
     get endpoint(): string { return `http://127.0.0.1:${this._port}/mcp/`; }
     get isRunning(): boolean { return this._running; }
+    get instanceId(): string { return this._instanceId; }
+    get isRegistered(): boolean { return this._registered; }
+
+    /** Broker 路由状态（供 debug_get_broker_status 工具调用）。 */
+    getBrokerStatus(): object {
+        return {
+            instanceId: this._instanceId,
+            backendPort: this._port,
+            brokerPort: this._brokerPort ?? null,
+            registered: this._registered,
+            running: this._running,
+            endpoint: this.endpoint
+        };
+    }
+
+    /** 列出 Broker 注册的所有实例（供 debug_list_instances 工具调用）。 */
+    async listInstances(): Promise<object> {
+        if (!this._brokerPort) {
+            return { brokerEnabled: false, instances: [{ instanceId: this._instanceId, port: this._port }] };
+        }
+        return new Promise((resolve) => {
+            const req = http.request({
+                hostname: '127.0.0.1',
+                port: this._brokerPort,
+                path: '/instances',
+                method: 'GET',
+                timeout: 2000
+            }, (res) => {
+                let data = '';
+                res.on('data', (c) => data += c);
+                res.on('end', () => {
+                    try {
+                        const body = JSON.parse(data);
+                        resolve({ brokerEnabled: true, brokerPort: this._brokerPort, ...body });
+                    } catch {
+                        resolve({ brokerEnabled: true, brokerPort: this._brokerPort, instances: [], error: 'Invalid response' });
+                    }
+                });
+            });
+            req.on('error', (e) => {
+                resolve({ brokerEnabled: true, brokerPort: this._brokerPort, instances: [], error: e.message });
+            });
+            req.on('timeout', () => { req.destroy(); resolve({ brokerEnabled: true, brokerPort: this._brokerPort, instances: [], error: 'timeout' }); });
+            req.end();
+        });
+    }
 
     async start(): Promise<boolean> {
         return new Promise((resolve) => {
-            this._server.listen(this._port, '127.0.0.1', () => {
+            // 有 Broker 时监听随机端口（0=OS 分配），否则监听配置端口（向后兼容）
+            const listenPort = this._brokerPort ? 0 : this._port;
+            this._server.listen(listenPort, '127.0.0.1', () => {
                 this._running = true;
-                this.log(`MCP server started on port ${this._port}`);
+                const addr = this._server.address();
+                if (typeof addr === 'object' && addr) {
+                    this._port = addr.port;
+                }
+                this.log(`MCP server started on port ${this._port} (instanceId=${this._instanceId})`);
+                // 向 Broker 注册（若配置了 brokerPort）
+                if (this._brokerPort) {
+                    this.registerWithBroker().then((ok) => {
+                        if (ok) this.startHeartbeat();
+                    });
+                }
                 resolve(true);
             });
             this._server.on('error', (err: NodeJS.ErrnoException) => {
@@ -42,6 +113,10 @@ export class McpServer {
     }
 
     async stop(): Promise<void> {
+        if (this._heartbeatTimer) { clearInterval(this._heartbeatTimer); this._heartbeatTimer = null; }
+        if (this._registered) {
+            await this.unregisterFromBroker().catch(() => {});
+        }
         if (!this._running) return;
         return new Promise((resolve) => {
             this._server.close(() => {
@@ -73,13 +148,13 @@ export class McpServer {
     // ── HTTP 请求处理 ──
 
     private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse) {
-        // 安全：拒绝浏览器跨域请求
-        const origin = req.headers.origin;
-        if (origin && req.method === 'POST') {
-            this.sendJson(res, 403, { error: 'Cross-origin requests are not allowed' });
+        // 安全：Host 头校验（防 DNS-rebinding）
+        if (!this.isHostAllowed(req.headers.host)) {
+            this.sendJson(res, 403, { error: 'Host header not allowed' });
             return;
         }
-        if (req.method === 'OPTIONS') {
+        // 安全：Origin 头校验（若存在必须指向本地回环，非浏览器跨域）
+        if (!this.isOriginAllowed(req.headers.origin)) {
             this.sendJson(res, 403, { error: 'Cross-origin requests are not allowed' });
             return;
         }
@@ -140,6 +215,107 @@ export class McpServer {
             'Content-Length': Buffer.byteLength(json)
         });
         res.end(json);
+    }
+
+    // ── 安全校验 ──
+
+    /** 从 Host 头提取 hostname（去掉端口），兼容 IPv6 [::1]:port。 */
+    private extractHostname(host: string): string {
+        if (host.startsWith('[')) {
+            const end = host.indexOf(']');
+            return end > 0 ? host.slice(1, end) : host;
+        }
+        const colon = host.indexOf(':');
+        return colon > 0 ? host.slice(0, colon) : host;
+    }
+
+    /** 校验 Host 头是否指向本地回环，防 DNS-rebinding 攻击。 */
+    private isHostAllowed(host: string | undefined): boolean {
+        if (!host) return false;
+        return ALLOWED_HOSTS.has(this.extractHostname(host));
+    }
+
+    /** 校验 Origin 头：若存在，必须指向本地回环（非浏览器跨域）。 */
+    private isOriginAllowed(origin: string | undefined): boolean {
+        if (!origin) return true; // 无 Origin 头（非浏览器请求）放行
+        try {
+            const u = new URL(origin);
+            return ALLOWED_HOSTS.has(u.hostname);
+        } catch {
+            return false;
+        }
+    }
+
+    // ── Broker 注册 ──
+
+    private async registerWithBroker(): Promise<boolean> {
+        if (!this._brokerPort) return false;
+        return new Promise((resolve) => {
+            const body = JSON.stringify({ instanceId: this._instanceId, port: this._port });
+            const req = http.request({
+                hostname: '127.0.0.1',
+                port: this._brokerPort,
+                path: '/register',
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+            }, (res) => {
+                let data = '';
+                res.on('data', (c) => data += c);
+                res.on('end', () => {
+                    if (res.statusCode === 200) {
+                        this._registered = true;
+                        this.log(`Registered with broker on port ${this._brokerPort}`);
+                        resolve(true);
+                    } else {
+                        this.log(`Broker registration failed: ${res.statusCode} ${data}`);
+                        resolve(false);
+                    }
+                });
+            });
+            req.on('error', (e) => {
+                this.log(`Broker registration error: ${e.message}`);
+                resolve(false);
+            });
+            req.end(body);
+        });
+    }
+
+    private async unregisterFromBroker(): Promise<boolean> {
+        if (!this._brokerPort) return false;
+        return new Promise((resolve) => {
+            const body = JSON.stringify({ instanceId: this._instanceId });
+            const req = http.request({
+                hostname: '127.0.0.1',
+                port: this._brokerPort,
+                path: '/unregister',
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+            }, (res) => {
+                res.on('end', () => {
+                    this._registered = false;
+                    resolve(true);
+                });
+            });
+            req.on('error', () => resolve(false));
+            req.end(body);
+        });
+    }
+
+    private startHeartbeat(): void {
+        this._heartbeatTimer = setInterval(() => {
+            if (!this._brokerPort || !this._registered) return;
+            const body = JSON.stringify({ instanceId: this._instanceId });
+            const req = http.request({
+                hostname: '127.0.0.1',
+                port: this._brokerPort,
+                path: '/heartbeat',
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+            }, () => {});
+            req.on('error', () => {});
+            req.end(body);
+        }, 10000); // 10s 心跳
+        this._heartbeatTimer.unref();
     }
 
     // ── JSON-RPC 处理 ──
@@ -248,9 +424,14 @@ export class McpServer {
             // ═══ 实例与状态 ═══
             case 'debug_get_status':
                 return dbg.getDebugStatus(args.expectedPauseId);
+            case 'debug_get_broker_status':
+                return this.getBrokerStatus();
+            case 'debug_list_instances':
+                return this.listInstances();
             case 'debug_list_processes':
                 return dbg.listProcesses(args.nameFilter, args.limit);
-            // ═══ 3. debug_verify_target → 已移除 ═══
+            case 'debug_verify_target':
+                return dbg.verifyTarget(args);
             case 'debug_attach_process':
                 return dbg.attachProcess(args);
             case 'debug_launch_and_attach':
@@ -283,12 +464,18 @@ export class McpServer {
                 return dbg.continueExecution(args.expectedPauseId);
             case 'debug_pause':
                 return dbg.pauseExecution(args.processId);
-            case 'debug_step':
-                return dbg.step(args.stepAction, args.expectedPauseId);
+            case 'debug_step_into':
+                return dbg.step('into', args.expectedPauseId);
+            case 'debug_step_over':
+                return dbg.step('over', args.expectedPauseId);
+            case 'debug_step_out':
+                return dbg.step('out', args.expectedPauseId);
             case 'debug_stop':
                 return dbg.stopDebugging(args.processId);
             case 'debug_wait_for_pause':
                 return dbg.waitForPause(args.timeoutMs);
+            case 'debug_start_test':
+                return dbg.startTest(args);
 
             // ═══ 线程与栈帧 ═══
             case 'debug_list_threads':
@@ -301,6 +488,8 @@ export class McpServer {
                 return fo.getFrameLocals(args.frameIndex, args.maxDepth, args.maxItems, args.expectedPauseId, args.names);
             case 'debug_list_variable_names':
                 return fo.listVariableNames(args.frameIndex, args.expectedPauseId);
+            case 'debug_get_variables_by_name':
+                return fo.getVariablesByName(args.frameIndex, args.names, args.maxDepth, args.expectedPauseId);
             // ═══ 27. debug_get_current_frame → 已合并到 debug_get_call_stack ═══
             case 'debug_get_call_stack':
                 return fo.getCallStack(args.limit, args.expectedPauseId);

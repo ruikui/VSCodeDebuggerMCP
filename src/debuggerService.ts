@@ -199,7 +199,31 @@ export class DebuggerService {
         return args;
     }
 
-    // ═══ 4. debug_verify_target → 已移除（attach_process 已包含验证逻辑） ═══
+    // ═══ 4. debug_verify_target（恢复：附加前只读校验） ═══
+    async verifyTarget(opts: { processId?: number; processName?: string; expectedExecutable: string; expectedSolution: string; engine: string }): Promise<{ valid: boolean; message: string; details?: object }> {
+        const wsCheck = this.validateWorkspace(opts.expectedSolution);
+        if (!wsCheck.valid) return { valid: false, message: wsCheck.error! };
+        let pid = opts.processId;
+        let resolvedByName = false;
+        if (!pid && opts.processName) {
+            const procs = await this.listProcesses(opts.processName, 10);
+            if (procs.length === 0) return { valid: false, message: `No process matching "${opts.processName}"` };
+            pid = procs[0].pid;
+            resolvedByName = true;
+        }
+        if (!pid) return { valid: false, message: 'processId or processName required' };
+        const procs = await this.listProcesses(undefined, 500);
+        const proc = procs.find(p => p.pid === pid);
+        if (!proc) return { valid: false, message: `Process ${pid} not found` };
+        const exe = proc.executablePath ?? proc.name ?? '';
+        const exeMatch = exe.toLowerCase() === opts.expectedExecutable.toLowerCase();
+        if (!exeMatch) return { valid: false, message: `Executable mismatch: expected ${opts.expectedExecutable}, got ${exe}` };
+        return {
+            valid: true,
+            message: `Target verified: PID ${pid}, executable ${exe}, engine ${opts.engine}`,
+            details: { processId: pid, executable: exe, engine: opts.engine, resolvedByName }
+        };
+    }
 
     // ═══ 5. debug_attach_process ═══
     async attachProcess(opts: { processId?: number; processName?: string; expectedExecutable: string; expectedSolution: string; engine?: string }): Promise<{ attached: boolean; message: string }> {
@@ -421,6 +445,51 @@ export class DebuggerService {
     }
 
     // ═══ 22. debug_get_stop_reason → 已合并到 debug_get_status ═══
+
+    // ═══ 21b. debug_start_test（VSCode Testing API） ═══
+    async startTest(opts: { testIds?: string[]; controllerId?: string; expectedSolution: string; timeoutMs?: number }): Promise<{ started: boolean; message: string }> {
+        const wsCheck = this.validateWorkspace(opts.expectedSolution);
+        if (!wsCheck.valid) return { started: false, message: wsCheck.error! };
+
+        // 使用 as any 绕过 @types/vscode 版本差异（testControllers/runProfiles 在 1.85+ 可用）
+        const testsApi = vscode.tests as any;
+        const controllers: Map<string, any> | undefined = testsApi.testControllers;
+        if (!controllers || controllers.size === 0) return { started: false, message: 'No test controller found' };
+
+        let ctrl: any;
+        if (opts.controllerId) {
+            ctrl = controllers.get(opts.controllerId);
+        } else {
+            for (const [, c] of controllers) {
+                if (c.runProfiles?.length > 0) { ctrl = c; break; }
+            }
+        }
+        if (!ctrl) return { started: false, message: 'No test controller with run profile found' };
+
+        let tests: vscode.TestItem[] = [];
+        if (opts.testIds) {
+            tests = opts.testIds.map(id => ctrl.items.get(id)).filter((t: any): t is vscode.TestItem => !!t);
+        }
+        if (tests.length === 0 && !opts.testIds) {
+            ctrl.items.forEach((t: any) => tests.push(t));
+        }
+        if (tests.length === 0) return { started: false, message: 'No matching test items found' };
+
+        const req = new vscode.TestRunRequest(tests);
+        const profile = ctrl.runProfiles?.find((p: any) => p.kind === vscode.TestRunProfileKind.Run) ?? ctrl.runProfiles?.[0];
+        if (!profile) return { started: false, message: 'No run profile found' };
+
+        const tokenSource = new vscode.CancellationTokenSource();
+        const timer = setTimeout(() => tokenSource.cancel(), opts.timeoutMs ?? 60000);
+        try {
+            await profile.run(req, tokenSource.token);
+            clearTimeout(timer);
+            return { started: true, message: `Test run completed, ${tests.length} tests` };
+        } catch (e: any) {
+            clearTimeout(timer);
+            return { started: false, message: `Test run failed: ${e.message}` };
+        }
+    }
 
     dispose() {
         for (const d of this._trackerDisposables) { try { d.dispose(); } catch {} }

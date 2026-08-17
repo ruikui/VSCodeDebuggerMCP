@@ -18,6 +18,16 @@ export const ToolDefinitions: McpTool[] = [
         }
     },
     {
+        name: 'debug_get_broker_status',
+        description: '获取 Broker 多窗口路由状态：当前实例的 instanceId、后端端口、Broker 端口、注册状态、运行状态。用于多会话路由诊断。',
+        inputSchema: { type: 'object', properties: {}, additionalProperties: false }
+    },
+    {
+        name: 'debug_list_instances',
+        description: '列出 Broker 注册的所有 VSCode 窗口实例（instanceId 和端口）。用于多会话路由：AI 可据此选择目标 instanceId 路由请求到特定窗口。',
+        inputSchema: { type: 'object', properties: {}, additionalProperties: false }
+    },
+    {
         name: 'debug_list_processes',
         description: '列出本地进程，可按名称过滤。',
         inputSchema: {
@@ -29,7 +39,23 @@ export const ToolDefinitions: McpTool[] = [
             additionalProperties: false
         }
     },
-    // ═══ 3. debug_verify_target → 已移除（attach_process 已包含验证逻辑） ═══
+    // ═══ 3. debug_verify_target（恢复：附加前只读校验） ═══
+    {
+        name: 'debug_verify_target',
+        description: '在 attach 前只读校验目标：检查进程是否存在、可执行文件路径是否匹配、工作区是否匹配、调试引擎类型是否支持。不修改任何状态。',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                processId: { type: 'integer', minimum: 1, description: '目标进程 PID' },
+                processName: { type: 'string', description: '可选。精确可执行文件名或完整进程路径。仅在省略 processId 时使用。' },
+                expectedExecutable: { type: 'string', description: '必需的绝对可执行文件路径。' },
+                expectedSolution: { type: 'string', description: '必需的绝对工作区路径。' },
+                engine: { type: 'string', description: '必需的调试器类型，例如 cppdbg、node、python、go' }
+            },
+            required: ['expectedExecutable', 'expectedSolution', 'engine'],
+            additionalProperties: false
+        }
+    },
     {
         name: 'debug_attach_process',
         description: '在验证可执行文件路径和工作区路径后，将 VSCode attach 到一个进程。',
@@ -207,15 +233,32 @@ export const ToolDefinitions: McpTool[] = [
         }
     },
     {
-        name: 'debug_step',
-        description: '执行单步调试：into（步进）、over（步过）、out（步出）。需要当前 pauseId。（合并了原 step_into/step_over/step_out）',
+        name: 'debug_step_into',
+        description: '步进（Step Into）：进入函数内部。需要当前 pauseId。',
         inputSchema: {
             type: 'object',
-            properties: {
-                stepAction: { type: 'string', enum: ['into', 'over', 'out'], description: '步进类型：into=步进，over=步过，out=步出' },
-                expectedPauseId: { type: 'string' }
-            },
-            required: ['stepAction', 'expectedPauseId'],
+            properties: { expectedPauseId: { type: 'string' } },
+            required: ['expectedPauseId'],
+            additionalProperties: false
+        }
+    },
+    {
+        name: 'debug_step_over',
+        description: '步过（Step Over）：跳过函数调用。需要当前 pauseId。',
+        inputSchema: {
+            type: 'object',
+            properties: { expectedPauseId: { type: 'string' } },
+            required: ['expectedPauseId'],
+            additionalProperties: false
+        }
+    },
+    {
+        name: 'debug_step_out',
+        description: '步出（Step Out）：跳出当前函数。需要当前 pauseId。',
+        inputSchema: {
+            type: 'object',
+            properties: { expectedPauseId: { type: 'string' } },
+            required: ['expectedPauseId'],
             additionalProperties: false
         }
     },
@@ -238,6 +281,21 @@ export const ToolDefinitions: McpTool[] = [
             properties: {
                 timeoutMs: { type: 'integer', minimum: 100, maximum: 120000, default: 30000 }
             },
+            additionalProperties: false
+        }
+    },
+    {
+        name: 'debug_start_test',
+        description: '使用 VSCode Testing API 启动测试运行。支持按测试 ID 运行指定测试，或运行整个测试套件。',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                testIds: { type: 'array', items: { type: 'string' }, description: '要运行的测试 ID 列表。省略时运行所有测试。' },
+                controllerId: { type: 'string', description: '可选。测试控制器 ID。省略时自动检测。' },
+                expectedSolution: { type: 'string', description: '必需的绝对工作区路径。' },
+                timeoutMs: { type: 'integer', minimum: 1000, maximum: 300000, default: 60000 }
+            },
+            required: ['expectedSolution'],
             additionalProperties: false
         }
     },
@@ -306,6 +364,21 @@ export const ToolDefinitions: McpTool[] = [
                 expectedPauseId: { type: 'string' }
             },
             required: ['frameIndex'],
+            additionalProperties: false
+        }
+    },
+    {
+        name: 'debug_get_variables_by_name',
+        description: '按变量名精确读取指定栈帧的变量值（最小权限读取）。最多 50 个变量名，仅返回匹配的变量，凭据值自动脱敏。适合 AI 只需读取特定变量而非全部局部变量的场景。',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                frameIndex: { type: 'integer', minimum: 0, description: '可选。省略时使用当前帧。' },
+                names: { type: 'array', items: { type: 'string' }, maxItems: 50, description: '要读取的变量名列表（最多 50 个）。' },
+                maxDepth: { type: 'integer', minimum: 0, maximum: 4, default: 1 },
+                expectedPauseId: { type: 'string' }
+            },
+            required: ['names'],
             additionalProperties: false
         }
     },

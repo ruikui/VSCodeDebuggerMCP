@@ -1,10 +1,14 @@
 import * as vscode from 'vscode';
+import * as child_process from 'child_process';
+import * as http from 'http';
+import * as path from 'path';
 import { DebuggerService } from './debuggerService';
 import { McpServer } from './mcpServer';
 
 let debuggerService: DebuggerService | undefined;
 let mcpServer: McpServer | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
+let brokerChild: child_process.ChildProcess | undefined;
 
 export async function activate(context: vscode.ExtensionContext) {
     debuggerService = new DebuggerService();
@@ -12,7 +16,16 @@ export async function activate(context: vscode.ExtensionContext) {
     const port = config.get<number>('port', 37643);
     const autoStart = config.get<boolean>('autoStart', true);
 
-    mcpServer = new McpServer(debuggerService, port);
+    // instanceId = session id，用于 Broker 路由
+    const instanceId = debuggerService.getDebugStatus().instanceId;
+    const useBroker = config.get<boolean>('useBroker', true);
+
+    // Broker：首窗口 fork 独立进程绑定公共端口
+    if (useBroker) {
+        brokerChild = await ensureBrokerRunning(port);
+    }
+
+    mcpServer = new McpServer(debuggerService, port, instanceId, useBroker ? port : undefined);
 
     // 状态栏
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 0);
@@ -22,12 +35,13 @@ export async function activate(context: vscode.ExtensionContext) {
     statusBarItem.show();
     context.subscriptions.push(statusBarItem);
 
-    // 命令
+    // 命令（新版：startServer/stopServer/restartServer/changePort/showStatus）
     context.subscriptions.push(
         vscode.commands.registerCommand('vscodeDebuggerMcp.showStatus', showStatus),
-        vscode.commands.registerCommand('vscodeDebuggerMcp.restart', restartServer),
-        vscode.commands.registerCommand('vscodeDebuggerMcp.start', startServer),
-        vscode.commands.registerCommand('vscodeDebuggerMcp.stop', stopServer)
+        vscode.commands.registerCommand('vscodeDebuggerMcp.restartServer', restartServer),
+        vscode.commands.registerCommand('vscodeDebuggerMcp.startServer', startServer),
+        vscode.commands.registerCommand('vscodeDebuggerMcp.stopServer', stopServer),
+        vscode.commands.registerCommand('vscodeDebuggerMcp.changePort', changePort)
     );
 
     // 配置变更监听
@@ -69,6 +83,49 @@ export async function deactivate() {
     if (debuggerService) {
         debuggerService.dispose();
     }
+    if (brokerChild) {
+        brokerChild.kill();
+        brokerChild = undefined;
+    }
+}
+
+/** 检查 Broker 是否已在运行（GET /health）。 */
+function checkBrokerHealth(port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+        const req = http.request({
+            hostname: '127.0.0.1',
+            port,
+            path: '/health',
+            method: 'GET',
+            timeout: 1000
+        }, (res) => {
+            resolve(res.statusCode === 200);
+        });
+        req.on('error', () => resolve(false));
+        req.on('timeout', () => { req.destroy(); resolve(false); });
+        req.end();
+    });
+}
+
+/** 确保 Broker 进程在运行：先检查健康，未运行则 fork。 */
+async function ensureBrokerRunning(port: number): Promise<child_process.ChildProcess | undefined> {
+    const alive = await checkBrokerHealth(port);
+    if (alive) return undefined; // 已有 Broker 在运行（其他窗口启动的）
+
+    // fork Broker 进程（编译后的 broker.js）
+    const brokerPath = path.join(__dirname, 'broker.js');
+    const child = child_process.fork(brokerPath, [String(port)], {
+        stdio: ['pipe', 'pipe', 'pipe', 'ipc']
+    });
+    child.stderr?.on('data', (d: Buffer) => {
+        console.error(`[broker] ${d.toString().trim()}`);
+    });
+    child.on('exit', (code) => {
+        console.error(`[broker] exited with code ${code}`);
+    });
+    // 等待 Broker 启动
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    return child;
 }
 
 async function startServer(): Promise<void> {
@@ -158,7 +215,7 @@ async function stopServer(): Promise<void> {
 }
 
 async function changePort(): Promise<void> {
-    if (!mcpServer) return;
+    if (!mcpServer || !debuggerService) return;
     const input = await vscode.window.showInputBox({
         prompt: '输入新的端口号 (1024–65535)',
         value: String(mcpServer.port),
@@ -172,7 +229,19 @@ async function changePort(): Promise<void> {
     const newPort = parseInt(input, 10);
     if (newPort === mcpServer.port) return;
     await vscode.workspace.getConfiguration('vscodeDebuggerMcp').update('port', newPort, vscode.ConfigurationTarget.Global);
-    const ok = await mcpServer.restart(newPort);
+
+    // Broker 架构：changePort 改的是 Broker 公共端口
+    await mcpServer.stop();
+    if (brokerChild) { brokerChild.kill(); brokerChild = undefined; }
+
+    const useBroker = vscode.workspace.getConfiguration('vscodeDebuggerMcp').get<boolean>('useBroker', true);
+    if (useBroker) {
+        brokerChild = await ensureBrokerRunning(newPort);
+    }
+    const instanceId = debuggerService.getDebugStatus().instanceId;
+    mcpServer = new McpServer(debuggerService, newPort, instanceId, useBroker ? newPort : undefined);
+    const ok = await mcpServer.start();
+
     if (ok) {
         vscode.window.showInformationMessage(`VSCode Debugger MCP restarted on port ${newPort}`);
     } else {

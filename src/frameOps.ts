@@ -149,6 +149,18 @@ export class FrameOps {
         };
     }
 
+    // ═══ 31b. debug_get_variables_by_name（最小权限读取，复用 getFrameLocals 的 names 过滤） ═══
+    async getVariablesByName(frameIndex: number | undefined, names: string[], maxDepth = 1, expectedPauseId?: string): Promise<{ variables: Variable[]; stale?: boolean; redacted?: boolean; redactionNotice?: string | null }> {
+        // 复用 getFrameLocals 的 names 过滤逻辑（保留脱敏和 pauseId 防护）
+        const result = await this.getFrameLocals(frameIndex, maxDepth, 100, expectedPauseId, names);
+        return {
+            variables: result.locals,
+            stale: result.stale,
+            redacted: result.redacted,
+            redactionNotice: result.redactionNotice
+        };
+    }
+
     // ═══ 32. debug_evaluate ═══
     async evaluate(opts: { expression: string; timeoutMs?: number; maxDepth?: number; maxItems?: number; expectedPauseId?: string }): Promise<{ result: string; type: string | null; children: Variable[]; stale?: boolean; redacted?: boolean; redactionNotice?: string | null }> {
         const v = this.svc.validatePauseIdOptional(opts.expectedPauseId);
