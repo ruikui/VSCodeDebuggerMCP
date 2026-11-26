@@ -19,12 +19,12 @@ export const ToolDefinitions: McpTool[] = [
     },
     {
         name: 'debug_get_broker_status',
-        description: '获取 Broker 多窗口路由状态：当前实例的 instanceId、后端端口、Broker 端口、注册状态、运行状态。用于多会话路由诊断。',
+        description: '获取 Broker 多窗口路由状态：当前实例的 instanceId、客户端端点（Broker 模式下为 Broker 端口）、后端端点/端口、Broker 端口、注册状态、运行状态。用于多会话路由诊断。',
         inputSchema: { type: 'object', properties: {}, additionalProperties: false }
     },
     {
         name: 'debug_list_instances',
-        description: '列出 Broker 注册的所有 VSCode 窗口实例（instanceId 和端口）。用于多会话路由：AI 可据此选择目标 instanceId 路由请求到特定窗口。',
+        description: '列出 Broker 注册的所有 VSCode 窗口实例（instanceId 和后端端口）。用于多会话路由：AI 可据此选择目标 instanceId 路由请求到特定窗口；客户端应连接返回的 endpoint（Broker 端口），后端端口仅供路由诊断。',
         inputSchema: { type: 'object', properties: {}, additionalProperties: false }
     },
     {

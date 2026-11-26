@@ -10,6 +10,13 @@ let mcpServer: McpServer | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
 let brokerChild: child_process.ChildProcess | undefined;
 
+/** 客户端应连接的端口：Broker 模式为 Broker 端口，直连模式为后端端口。 */
+let configuredPort = 37643;
+/** 当前是否使用 Broker 模式，决定状态栏和详情展示哪个端口。 */
+let useBrokerMode = true;
+/** changePort 更新配置会触发配置变更事件，用它避免对同一服务重复重启。 */
+let applyingPort = false;
+
 export async function activate(context: vscode.ExtensionContext) {
     debuggerService = new DebuggerService();
     const config = vscode.workspace.getConfiguration('vscodeDebuggerMcp');
@@ -19,6 +26,8 @@ export async function activate(context: vscode.ExtensionContext) {
     // instanceId = session id，用于 Broker 路由
     const instanceId = debuggerService.getDebugStatus().instanceId;
     const useBroker = config.get<boolean>('useBroker', true);
+    configuredPort = port;
+    useBrokerMode = useBroker;
 
     // Broker：首窗口 fork 独立进程绑定公共端口
     if (useBroker) {
@@ -44,14 +53,13 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('vscodeDebuggerMcp.changePort', changePort)
     );
 
-    // 配置变更监听
+    // 配置变更监听：外部修改端口时重建服务；changePort 自己更新时跳过，避免并发重启。
     context.subscriptions.push(
         vscode.workspace.onDidChangeConfiguration(e => {
-            if (e.affectsConfiguration('vscodeDebuggerMcp.port')) {
-                const newPort = vscode.workspace.getConfiguration('vscodeDebuggerMcp').get<number>('port', 37643);
-                if (mcpServer && mcpServer.isRunning && newPort !== mcpServer.port) {
-                    restartServer(newPort);
-                }
+            if (applyingPort || !e.affectsConfiguration('vscodeDebuggerMcp.port')) return;
+            const newPort = vscode.workspace.getConfiguration('vscodeDebuggerMcp').get<number>('port', 37643);
+            if (mcpServer && newPort !== configuredPort) {
+                void applyPortAndReport(newPort);
             }
         })
     );
@@ -89,7 +97,7 @@ export async function deactivate() {
     }
 }
 
-/** 检查 Broker 是否已在运行（GET /health）。 */
+/** 检查指定端口上是否运行着 Broker（GET /health，响应必须标记 broker: true）。 */
 function checkBrokerHealth(port: number): Promise<boolean> {
     return new Promise((resolve) => {
         const req = http.request({
@@ -99,7 +107,17 @@ function checkBrokerHealth(port: number): Promise<boolean> {
             method: 'GET',
             timeout: 1000
         }, (res) => {
-            resolve(res.statusCode === 200);
+            let data = '';
+            res.setEncoding('utf8');
+            res.on('data', (chunk) => data += chunk);
+            res.on('end', () => {
+                if (res.statusCode !== 200) { resolve(false); return; }
+                try {
+                    resolve(JSON.parse(data).broker === true);
+                } catch {
+                    resolve(false);
+                }
+            });
         });
         req.on('error', () => resolve(false));
         req.on('timeout', () => { req.destroy(); resolve(false); });
@@ -107,7 +125,7 @@ function checkBrokerHealth(port: number): Promise<boolean> {
     });
 }
 
-/** 确保 Broker 进程在运行：先检查健康，未运行则 fork。 */
+/** 确保 Broker 进程在运行：先检查健康，未运行则 fork 并等待监听完成。 */
 async function ensureBrokerRunning(port: number): Promise<child_process.ChildProcess | undefined> {
     const alive = await checkBrokerHealth(port);
     if (alive) return undefined; // 已有 Broker 在运行（其他窗口启动的）
@@ -123,31 +141,74 @@ async function ensureBrokerRunning(port: number): Promise<child_process.ChildPro
     child.on('exit', (code) => {
         console.error(`[broker] exited with code ${code}`);
     });
-    // 等待 Broker 启动
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    // 等待 Broker 完成监听；后端注册也会重试，这里尽量缩短首次连接窗口。
+    for (let attempt = 0; attempt < 15; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        if (await checkBrokerHealth(port)) return child;
+    }
     return child;
+}
+
+/** 客户端应连接的端口：Broker 模式为配置端口，直连模式为后端实际端口。 */
+function clientPort(): number {
+    return useBrokerMode ? configuredPort : (mcpServer?.port ?? configuredPort);
 }
 
 async function startServer(): Promise<void> {
     if (!mcpServer) return;
     const ok = await mcpServer.start();
     if (ok) {
-        vscode.window.showInformationMessage(`VSCode Debugger MCP started on port ${mcpServer.port}`);
+        vscode.window.showInformationMessage(`VSCode Debugger MCP started on port ${clientPort()}`);
     } else {
-        vscode.window.showErrorMessage(`VSCode Debugger MCP failed to start on port ${mcpServer.port}`);
+        vscode.window.showErrorMessage(`VSCode Debugger MCP failed to start on port ${clientPort()}`);
     }
     updateStatusBar();
 }
 
-async function restartServer(newPort?: number): Promise<void> {
-    if (!mcpServer) return;
-    const ok = await mcpServer.restart(newPort);
+/**
+ * 按新端口重建 Broker/后端。changePort 命令与外部配置变更共用此路径，
+ * 避免对同一个 McpServer 并发执行 stop/start。
+ */
+async function applyPort(newPort: number): Promise<boolean> {
+    if (!mcpServer || !debuggerService) return false;
+    const previousPort = configuredPort;
+    configuredPort = newPort;
+    await mcpServer.stop();
+
+    const useBroker = vscode.workspace.getConfiguration('vscodeDebuggerMcp').get<boolean>('useBroker', true);
+    useBrokerMode = useBroker;
+    if (useBroker) {
+        // 端口变化时结束旧 Broker；同端口重建时复用仍在运行的 Broker。
+        if (newPort !== previousPort && brokerChild) {
+            brokerChild.kill();
+            brokerChild = undefined;
+        }
+        const child = await ensureBrokerRunning(newPort);
+        if (child) brokerChild = child;
+    } else if (brokerChild) {
+        brokerChild.kill();
+        brokerChild = undefined;
+    }
+
+    const instanceId = debuggerService.getDebugStatus().instanceId;
+    mcpServer = new McpServer(debuggerService, newPort, instanceId, useBroker ? newPort : undefined);
+    return mcpServer.start();
+}
+
+/** 重建服务并提示结果。 */
+async function applyPortAndReport(newPort: number): Promise<void> {
+    const ok = await applyPort(newPort);
     if (ok) {
-        vscode.window.showInformationMessage(`VSCode Debugger MCP restarted on port ${mcpServer.port}`);
+        vscode.window.showInformationMessage(`VSCode Debugger MCP restarted on port ${clientPort()}`);
     } else {
-        vscode.window.showErrorMessage(`VSCode Debugger MCP failed to restart on port ${mcpServer.port}`);
+        vscode.window.showErrorMessage(`VSCode Debugger MCP failed to restart on port ${clientPort()}`);
     }
     updateStatusBar();
+}
+
+async function restartServer(): Promise<void> {
+    if (!mcpServer) return;
+    await applyPortAndReport(configuredPort);
 }
 
 function updateStatusBar(): void {
@@ -155,17 +216,19 @@ function updateStatusBar(): void {
     const running = mcpServer.isRunning;
     const status = debuggerService.getCurrentState();
     const session = vscode.debug.activeDebugSession;
+    const port = clientPort();
+    const brokerSuffix = useBrokerMode ? ' (broker)' : '';
 
     if (!running) {
         statusBarItem.text = '$(debug) VSCodeDebugMCP: Off';
         statusBarItem.tooltip = 'VSCode Debugger MCP (stopped)';
     } else if (session) {
         const icon = status === 'paused' ? '$(debug-pause)' : '$(debug-start)';
-        statusBarItem.text = `${icon} VSCodeDebugMCP:${mcpServer.port} ${status}`;
-        statusBarItem.tooltip = `VSCode Debugger MCP\nPort: ${mcpServer.port}\nSession: ${session.name}\nState: ${status}`;
+        statusBarItem.text = `${icon} VSCodeDebugMCP:${port} ${status}`;
+        statusBarItem.tooltip = `VSCode Debugger MCP\nPort: ${port}${brokerSuffix}\nSession: ${session.name}\nState: ${status}`;
     } else {
-        statusBarItem.text = `$(debug) VSCodeDebugMCP:${mcpServer.port}`;
-        statusBarItem.tooltip = `VSCode Debugger MCP\nPort: ${mcpServer.port}\nNo active debug session`;
+        statusBarItem.text = `$(debug) VSCodeDebugMCP:${port}`;
+        statusBarItem.tooltip = `VSCode Debugger MCP\nPort: ${port}${brokerSuffix}\nNo active debug session`;
     }
 }
 
@@ -173,7 +236,7 @@ async function showStatus(): Promise<void> {
     if (!mcpServer || !debuggerService) return;
 
     const running = mcpServer.isRunning;
-    const port = mcpServer.port;
+    const port = clientPort();
 
     const items: Array<vscode.QuickPickItem & { action?: string }> = [
         { label: running ? '$(debug-start) 重启 MCP 服务' : '$(debug-start) 开始 MCP 服务', action: running ? 'restart' : 'start' },
@@ -218,7 +281,7 @@ async function changePort(): Promise<void> {
     if (!mcpServer || !debuggerService) return;
     const input = await vscode.window.showInputBox({
         prompt: '输入新的端口号 (1024–65535)',
-        value: String(mcpServer.port),
+        value: String(clientPort()),
         validateInput: (v) => {
             const n = parseInt(v, 10);
             if (isNaN(n) || n < 1024 || n > 65535) return '请输入 1024–65535 之间的数字';
@@ -227,33 +290,23 @@ async function changePort(): Promise<void> {
     });
     if (!input) return;
     const newPort = parseInt(input, 10);
-    if (newPort === mcpServer.port) return;
-    await vscode.workspace.getConfiguration('vscodeDebuggerMcp').update('port', newPort, vscode.ConfigurationTarget.Global);
+    if (newPort === clientPort()) return;
 
-    // Broker 架构：changePort 改的是 Broker 公共端口
-    await mcpServer.stop();
-    if (brokerChild) { brokerChild.kill(); brokerChild = undefined; }
-
-    const useBroker = vscode.workspace.getConfiguration('vscodeDebuggerMcp').get<boolean>('useBroker', true);
-    if (useBroker) {
-        brokerChild = await ensureBrokerRunning(newPort);
+    // 更新配置会触发 onDidChangeConfiguration；这里自己完成重启，避免双重重启。
+    applyingPort = true;
+    try {
+        await vscode.workspace.getConfiguration('vscodeDebuggerMcp').update('port', newPort, vscode.ConfigurationTarget.Global);
+        await applyPortAndReport(newPort);
+    } finally {
+        applyingPort = false;
     }
-    const instanceId = debuggerService.getDebugStatus().instanceId;
-    mcpServer = new McpServer(debuggerService, newPort, instanceId, useBroker ? newPort : undefined);
-    const ok = await mcpServer.start();
-
-    if (ok) {
-        vscode.window.showInformationMessage(`VSCode Debugger MCP restarted on port ${newPort}`);
-    } else {
-        vscode.window.showErrorMessage(`VSCode Debugger MCP failed to restart on port ${newPort}`);
-    }
-    updateStatusBar();
 }
 
 async function showDetails(): Promise<void> {
     if (!mcpServer || !debuggerService) return;
     const status = debuggerService.getDebugStatus();
     const log = mcpServer.getLog().slice(-10).join('\n');
+    const endpoint = useBrokerMode ? `http://127.0.0.1:${configuredPort}/mcp/` : mcpServer.endpoint;
 
     const panel = vscode.window.createOutputChannel('VSCode Debugger MCP');
     panel.clear();
@@ -262,7 +315,10 @@ async function showDetails(): Promise<void> {
     panel.appendLine('═══════════════════════════════════════');
     panel.appendLine('');
     panel.appendLine(`Server:        ${mcpServer.isRunning ? 'Running' : 'Stopped'}`);
-    panel.appendLine(`Endpoint:      ${mcpServer.endpoint}`);
+    panel.appendLine(`Endpoint:      ${endpoint}${useBrokerMode ? ' (broker)' : ''}`);
+    if (useBrokerMode) {
+        panel.appendLine(`Backend Port:  ${mcpServer.port}`);
+    }
     panel.appendLine(`Instance ID:   ${status.instanceId}`);
     panel.appendLine(`IDE:           ${status.ide} ${status.version}`);
     panel.appendLine(`Workspace:     ${status.workspace || '(none)'}`);

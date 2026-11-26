@@ -119,6 +119,10 @@ async function testMCPRouting(): Promise<void> {
     const broker = new Broker(0);
     await broker.start();
 
+    // 0. 无实例时无法路由
+    const noInstances = await httpPost(broker.port, '/mcp', { jsonrpc: '2.0', id: 0, method: 'debug_get_status' });
+    assert(noInstances.status === 503, '无实例时 MCP 请求返回 503');
+
     const backend = await startMockBackend();
     await httpPost(broker.port, '/register', { instanceId: 'inst-a', port: backend.port });
 
@@ -134,21 +138,29 @@ async function testMCPRouting(): Promise<void> {
     assert(viaHeader.status === 200, 'X-Instance-Id 头路由返回 200');
     assert(JSON.parse(viaHeader.body).result?.echoed === 'debug_list_threads', '头路由正确转发');
 
-    // 3. 缺 instanceId
-    const noId = await httpPost(broker.port, '/mcp', { method: 'debug_get_status' });
-    assert(noId.status === 400, '缺 instanceId 返回 400');
+    // 3. 单实例时缺 instanceId 自动路由（兼容静态 MCP 配置的客户端）
+    const autoRoute = await httpPost(broker.port, '/mcp', { jsonrpc: '2.0', id: 3, method: 'debug_get_status' });
+    assert(autoRoute.status === 200, '单实例时缺 instanceId 自动路由');
+    assert(JSON.parse(autoRoute.body).result?.echoed === 'debug_get_status', '自动路由到唯一后端');
 
-    // 4. 不存在的实例
+    // 4. 多实例时缺 instanceId 必须报错
+    await httpPost(broker.port, '/register', { instanceId: 'inst-b', port: backend.port });
+    const ambiguous = await httpPost(broker.port, '/mcp', { jsonrpc: '2.0', id: 4, method: 'debug_get_status' });
+    assert(ambiguous.status === 400, '多实例时缺 instanceId 返回 400');
+    await httpPost(broker.port, '/unregister', { instanceId: 'inst-b' });
+
+    // 5. 不存在的实例
     const notFound = await httpPost(broker.port, '/mcp?instanceId=ghost', { method: 'x' });
     assert(notFound.status === 404, '不存在的实例返回 404');
 
-    // 5. 后端不可达
+    // 6. 后端不可达
     const deadPort = await reserveFreePort();
     await httpPost(broker.port, '/register', { instanceId: 'inst-dead', port: deadPort });
     const dead = await httpPost(broker.port, '/mcp?instanceId=inst-dead', { method: 'x' });
     assert(dead.status === 502, '后端不可达返回 502');
+    await httpPost(broker.port, '/unregister', { instanceId: 'inst-dead' });
 
-    // 6. 注销后路由
+    // 7. 注销后路由
     await httpPost(broker.port, '/unregister', { instanceId: 'inst-a' });
     const afterUnreg = await httpPost(broker.port, '/mcp?instanceId=inst-a', { method: 'x' });
     assert(afterUnreg.status === 404, '注销后路由返回 404');

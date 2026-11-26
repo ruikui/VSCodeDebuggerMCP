@@ -10,6 +10,7 @@ import * as http from 'http';
  * 生命周期：
  * - 首个窗口 fork 本进程，绑定公共端口
  * - 各窗口后端启动后 POST /register 注册，并定期 POST /heartbeat
+ * - 客户端通过 instanceId 路由；仅一个实例注册时自动路由
  * - 所有实例注销后（空闲超时）本进程自动退出
  */
 
@@ -203,12 +204,23 @@ export class Broker {
         }
         if (!instanceId) instanceId = req.headers['x-instance-id'] as string | undefined;
 
+        this.purgeStale();
+
         if (!instanceId) {
-            this.sendJson(res, 400, { error: 'instanceId required (query param or X-Instance-Id header)' });
-            return;
+            // 仅一个窗口注册时自动路由，兼容无法附加自定义请求头的 MCP 客户端。
+            if (this._instances.size === 0) {
+                this.sendJson(res, 503, { error: 'No VSCode instances registered' });
+                return;
+            }
+            if (this._instances.size > 1) {
+                this.sendJson(res, 400, {
+                    error: 'instanceId required when multiple VSCode instances are registered (query param or X-Instance-Id header)'
+                });
+                return;
+            }
+            instanceId = this._instances.keys().next().value as string;
         }
 
-        this.purgeStale();
         const rec = this._instances.get(instanceId);
         if (!rec) {
             this.sendJson(res, 404, { error: `Instance ${instanceId} not found` });

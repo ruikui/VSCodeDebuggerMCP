@@ -45,11 +45,13 @@ export class McpServer {
     getBrokerStatus(): object {
         return {
             instanceId: this._instanceId,
+            // endpoint 始终是客户端应连接的地址；Broker 模式下是 Broker 端口，直连模式下是后端本身。
+            endpoint: this._brokerPort ? `http://127.0.0.1:${this._brokerPort}/mcp/` : this.endpoint,
+            backendEndpoint: this.endpoint,
             backendPort: this._port,
             brokerPort: this._brokerPort ?? null,
             registered: this._registered,
-            running: this._running,
-            endpoint: this.endpoint
+            running: this._running
         };
     }
 
@@ -59,6 +61,7 @@ export class McpServer {
             return { brokerEnabled: false, instances: [{ instanceId: this._instanceId, port: this._port }] };
         }
         return new Promise((resolve) => {
+            const endpoint = `http://127.0.0.1:${this._brokerPort}/mcp/`;
             const req = http.request({
                 hostname: '127.0.0.1',
                 port: this._brokerPort,
@@ -71,24 +74,26 @@ export class McpServer {
                 res.on('end', () => {
                     try {
                         const body = JSON.parse(data);
-                        resolve({ brokerEnabled: true, brokerPort: this._brokerPort, ...body });
+                        resolve({ brokerEnabled: true, brokerPort: this._brokerPort, endpoint, ...body });
                     } catch {
-                        resolve({ brokerEnabled: true, brokerPort: this._brokerPort, instances: [], error: 'Invalid response' });
+                        resolve({ brokerEnabled: true, brokerPort: this._brokerPort, endpoint, instances: [], error: 'Invalid response' });
                     }
                 });
             });
             req.on('error', (e) => {
-                resolve({ brokerEnabled: true, brokerPort: this._brokerPort, instances: [], error: e.message });
+                resolve({ brokerEnabled: true, brokerPort: this._brokerPort, endpoint, instances: [], error: e.message });
             });
-            req.on('timeout', () => { req.destroy(); resolve({ brokerEnabled: true, brokerPort: this._brokerPort, instances: [], error: 'timeout' }); });
+            req.on('timeout', () => { req.destroy(); resolve({ brokerEnabled: true, brokerPort: this._brokerPort, endpoint, instances: [], error: 'timeout' }); });
             req.end();
         });
     }
 
     async start(): Promise<boolean> {
+        if (this._running) return true;
         return new Promise((resolve) => {
             // 有 Broker 时监听随机端口（0=OS 分配），否则监听配置端口（向后兼容）
             const listenPort = this._brokerPort ? 0 : this._port;
+            this._registered = false;
             this._server.listen(listenPort, '127.0.0.1', () => {
                 this._running = true;
                 const addr = this._server.address();
@@ -96,11 +101,11 @@ export class McpServer {
                     this._port = addr.port;
                 }
                 this.log(`MCP server started on port ${this._port} (instanceId=${this._instanceId})`);
-                // 向 Broker 注册（若配置了 brokerPort）
+                // 向 Broker 注册（若配置了 brokerPort）。Broker 可能尚未监听，注册自带重试；
+                // 心跳定时器也会在未注册时继续补注册。
                 if (this._brokerPort) {
-                    this.registerWithBroker().then((ok) => {
-                        if (ok) this.startHeartbeat();
-                    });
+                    void this.registerWithBrokerWithRetry();
+                    this.startHeartbeat();
                 }
                 resolve(true);
             });
@@ -116,6 +121,7 @@ export class McpServer {
         if (this._heartbeatTimer) { clearInterval(this._heartbeatTimer); this._heartbeatTimer = null; }
         if (this._registered) {
             await this.unregisterFromBroker().catch(() => {});
+            this._registered = false;
         }
         if (!this._running) return;
         return new Promise((resolve) => {
@@ -125,6 +131,17 @@ export class McpServer {
                 resolve();
             });
         });
+    }
+
+    /** 向 Broker 注册，失败时重试：Broker 进程可能尚未完成监听。 */
+    private async registerWithBrokerWithRetry(attempts = 5, delayMs = 300, quiet = false): Promise<boolean> {
+        for (let attempt = 0; attempt < attempts; attempt++) {
+            if (await this.registerWithBroker(quiet)) return true;
+            if (attempt < attempts - 1) {
+                await new Promise((resolve) => setTimeout(resolve, delayMs));
+            }
+        }
+        return false;
     }
 
     async restart(newPort?: number): Promise<boolean> {
@@ -248,7 +265,7 @@ export class McpServer {
 
     // ── Broker 注册 ──
 
-    private async registerWithBroker(): Promise<boolean> {
+    private async registerWithBroker(quiet = false): Promise<boolean> {
         if (!this._brokerPort) return false;
         return new Promise((resolve) => {
             const body = JSON.stringify({ instanceId: this._instanceId, port: this._port });
@@ -267,13 +284,13 @@ export class McpServer {
                         this.log(`Registered with broker on port ${this._brokerPort}`);
                         resolve(true);
                     } else {
-                        this.log(`Broker registration failed: ${res.statusCode} ${data}`);
+                        if (!quiet) this.log(`Broker registration failed: ${res.statusCode} ${data}`);
                         resolve(false);
                     }
                 });
             });
             req.on('error', (e) => {
-                this.log(`Broker registration error: ${e.message}`);
+                if (!quiet) this.log(`Broker registration error: ${e.message}`);
                 resolve(false);
             });
             req.end(body);
@@ -302,8 +319,14 @@ export class McpServer {
     }
 
     private startHeartbeat(): void {
+        if (this._heartbeatTimer) { clearInterval(this._heartbeatTimer); this._heartbeatTimer = null; }
         this._heartbeatTimer = setInterval(() => {
-            if (!this._brokerPort || !this._registered) return;
+            if (!this._brokerPort) return;
+            // 失联或漏注册时，下一拍先补注册；成功后恢复心跳。
+            if (!this._registered) {
+                void this.registerWithBrokerWithRetry(1, 0, true);
+                return;
+            }
             const body = JSON.stringify({ instanceId: this._instanceId });
             const req = http.request({
                 hostname: '127.0.0.1',
@@ -311,8 +334,11 @@ export class McpServer {
                 path: '/heartbeat',
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
-            }, () => {});
-            req.on('error', () => {});
+            }, (res) => {
+                res.resume();
+                if (res.statusCode !== 200) this._registered = false;
+            });
+            req.on('error', () => { this._registered = false; });
             req.end(body);
         }, 10000); // 10s 心跳
         this._heartbeatTimer.unref();

@@ -108,13 +108,16 @@ http://127.0.0.1:37643/mcp/
 
 ### 多窗口 Broker 模式（`useBroker: true`，默认）
 
-Broker 绑定公共端口（默认 37643），客户端请求需携带 `instanceId` 将请求路由到指定窗口：
+Broker 绑定公共端口（默认 37643）。仅一个窗口注册时，Broker 自动路由到该窗口，
+客户端可直接使用 `http://127.0.0.1:37643/mcp/`，无需 `instanceId`（适用于 VS Code、Claude Code 等静态 MCP 配置）。
+
+多个窗口同时注册时，请求必须携带 `instanceId` 指定目标窗口：
 
 - 通过查询参数：`POST http://127.0.0.1:37643/mcp?instanceId=<id>`
 - 或通过请求头：`X-Instance-Id: <id>`
 
 先调用 `debug_list_instances` 获取已注册的窗口 `instanceId` 列表，再选择目标窗口路由。
-若客户端不支持自定义请求头/查询参数，可将 `vscodeDebuggerMcp.useBroker` 设为 `false` 退回单窗口直连模式。
+若客户端不支持自定义请求头/查询参数且确实需要多窗口，可将 `vscodeDebuggerMcp.useBroker` 设为 `false` 退回单窗口直连模式。
 
 ## 扩展配置
 

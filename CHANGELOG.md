@@ -15,6 +15,11 @@
 - **ESLint 配置**：`.eslintrc.json`，修复此前缺依赖无法运行的问题。
 - **自动化测试**：`test/` 目录，Broker 路由和 Host 校验测试。
 
+### Fixed
+- **单实例自动路由**：仅一个窗口注册时，Broker 不再要求 `instanceId`，静态 `mcp.json` 客户端（VS Code、Claude Code 等）可直接连接 Broker 端口。
+- **Broker 注册可靠性**：注册失败自动重试；心跳失败会清除注册状态并在下一拍补注册，避免 Broker 重启后永久失联。
+- **修改端口稳定性**：`changePort` 与配置变更监听不再并发重启同一个服务；端口变更时同步重建 Broker。状态栏与详情改为显示客户端应连接的端口（Broker 模式下为 Broker 端口）。
+
 ### Changed
 - **命令重命名**：`start` → `startServer`，`stop` → `stopServer`，`restart` → `restartServer`（旧命令 ID 不再注册）。
 - **`debug_step` 拆分**：拆分为 `debug_step_into`、`debug_step_over`、`debug_step_out` 三个独立工具，对 AI 更直观（无需记忆 `stepAction` 参数）。
